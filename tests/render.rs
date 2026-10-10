@@ -148,7 +148,7 @@ fn bounds(pixels: &[(u32, u32)]) -> (RangeInclusive<u32>, RangeInclusive<u32>) {
     )
 }
 
-fn png_of(plan: &Plan, size: u32) -> Pixmap {
+fn pixmap_of(plan: &Plan, size: u32) -> Pixmap {
     Pixmap::decode_png(&render(plan, size).expect("renders").png).expect("a PNG")
 }
 
@@ -179,12 +179,12 @@ fn north_arrow_stays_off_the_plan_and_the_footer_at_every_angle_and_shape() {
             let mut empty = room_plan(dx, dy, 0.0);
             empty.features.clear();
             let (plan_x, plan_y) = bounds(&changed_pixels(
-                &png_of(&room_plan(dx, dy, 0.0), size),
-                &png_of(&empty, size),
+                &pixmap_of(&room_plan(dx, dy, 0.0), size),
+                &pixmap_of(&empty, size),
             ));
             for rotation in (0..8).map(|i| f64::from(i) * 45.0) {
-                let a = png_of(&room_plan(dx, dy, rotation), size);
-                let b = png_of(&room_plan(dx, dy, rotation + 100.0), size);
+                let a = pixmap_of(&room_plan(dx, dy, rotation), size);
+                let b = pixmap_of(&room_plan(dx, dy, rotation + 100.0), size);
                 let (w, h) = (a.width(), a.height());
                 let arrow = changed_pixels(&a, &b);
                 let case = format!("{dx} by {dy} m at {size} px, {rotation} degrees");
@@ -205,31 +205,61 @@ fn north_arrow_stays_off_the_plan_and_the_footer_at_every_angle_and_shape() {
 
 #[test]
 fn a_long_label_at_the_plan_edge_stays_out_from_under_the_north_arrow() {
-    let with_light = |rotation, label: Option<(&str, f64, f64)>| {
+    let with_light = |rotation, y: f64, label: bool| {
         let mut plan = room_plan(9.0, 3.0, rotation);
-        let light = json!({"type": "Point", "coordinates": [9.0, 3.0]});
+        let light = json!({"type": "Point", "coordinates": [9.0, y]});
+        let label = label.then_some(("A ceiling light with a long name", 9.0, y));
         plan.features
             .push(feature(light, Style::Object { kind: "light".into() }, label, false));
         plan
     };
     for size in [200, 1600] {
-        let label = Some(("A ceiling light with a long name", 9.0, 3.0));
         let mut arrow = Vec::new();
         for rotation in (0..8).map(|i| f64::from(i) * 45.0) {
             arrow.extend(changed_pixels(
-                &png_of(&with_light(rotation, label), size),
-                &png_of(&with_light(rotation + 100.0, label), size),
+                &pixmap_of(&with_light(rotation, 3.0, false), size),
+                &pixmap_of(&with_light(rotation + 100.0, 3.0, false), size),
             ));
         }
         let (arrow_x, arrow_y) = bounds(&arrow);
-        let text = changed_pixels(
-            &png_of(&with_light(0.0, label), size),
-            &png_of(&with_light(0.0, None), size),
-        );
-        assert!(!text.is_empty(), "at {size} px: no label drawn");
-        for (x, y) in text {
-            let under_arrow = arrow_x.contains(&x) && arrow_y.contains(&y);
-            assert!(!under_arrow, "at {size} px: label under the arrow at ({x}, {y})");
+        // Labels level with the arrow's top, middle and lower rows, and one
+        // well below it.
+        for y in [3.0, 2.9, 2.8, 0.5] {
+            let text = changed_pixels(
+                &pixmap_of(&with_light(0.0, y, true), size),
+                &pixmap_of(&with_light(0.0, y, false), size),
+            );
+            let case = format!("at {size} px, a label at y = {y} m");
+            assert!(!text.is_empty(), "{case}: no label drawn");
+            for &(x, y) in &text {
+                let under_arrow = arrow_x.contains(&x) && arrow_y.contains(&y);
+                assert!(!under_arrow, "{case}: label under the arrow at ({x}, {y})");
+            }
+            // At 1600 px the lowest label is well below the arrow, so it runs
+            // on into the arrow's column unclipped.
+            if size == 1600 && y == 0.5 {
+                assert!(
+                    text.iter().any(|&(x, _)| arrow_x.contains(&x)),
+                    "{case}: label clipped in the column below the arrow"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn neither_side_passes_the_requested_size() {
+    for (dx, dy) in [(9.0, 3.0), (3.0, 9.0), (10.0, 10.0), (10.0, 9.99), (0.0, 0.0)] {
+        for size in [200, 1600] {
+            let pixmap = pixmap_of(&room_plan(dx, dy, 0.0), size);
+            let long = pixmap.width().max(pixmap.height());
+            assert_eq!(
+                long,
+                size,
+                "{dx} by {dy} m at {size} px is {}x{}",
+                pixmap.width(),
+                pixmap.height()
+            );
         }
     }
 }

@@ -80,6 +80,15 @@ async fn ok(client: &RunningService<RoleClient, ()>, tool: &'static str, args: V
     serde_json::from_str(&text.text).unwrap_or_else(|_| Value::String(text.text.clone()))
 }
 
+/// One field of every item in a list, in order.
+fn column(list: &Value, key: &str) -> Vec<Value> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|item| item[key].clone())
+        .collect()
+}
+
 /// The names in `list[key]`, sorted, for lists whose order is not promised.
 fn sorted_names(list: &Value, key: &str) -> Vec<String> {
     let mut names: Vec<String> = column(&list[key], "name")
@@ -973,16 +982,8 @@ async fn site_and_floor(rw: &RunningService<RoleClient, ()>, name: &str) -> (i64
     (site, floor)
 }
 
-/// One field of every item in a list, in order.
-fn column(list: &Value, key: &str) -> Vec<Value> {
-    list.as_array()
-        .expect("a list")
-        .iter()
-        .map(|item| item[key].clone())
-        .collect()
-}
-
-/// A square about 8 m across with its south west corner at `lon`, 45° N.
+/// A ring 0.0001° on a side, about 8 m by 11 m, with its south west corner
+/// at `lon`, 45° N.
 fn square(lon: f64) -> Value {
     json!([[
         [lon, 45.0],
@@ -994,7 +995,7 @@ fn square(lon: f64) -> Value {
 }
 
 /// A GeoJSON Feature with `name` as its one property.
-fn named_feature(geometry: Value, name: String) -> Value {
+fn named_feature(geometry: Value, name: &str) -> Value {
     json!({"type": "Feature", "properties": {"name": name}, "geometry": geometry})
 }
 
@@ -1003,10 +1004,10 @@ async fn nearest_and_what_is_at_list_the_nearest_first() {
     let server = start().await;
     let rw = client(&server, RW).await;
     let (site, floor) = site_and_floor(&rw, "Order").await;
-    // The far light is made first, so neither id nor name order is nearest
-    // first.
-    let mut lights = Vec::new();
-    for (name, x) in [("far", 5.0), ("near", 1.0)] {
+    // Made in the order a, c, b at 5, 3 and 1 m, so nearest first is b, c, a,
+    // which neither id order nor name order in either direction gives.
+    let mut ids = Vec::new();
+    for (name, x) in [("a", 5.0), ("c", 3.0), ("b", 1.0)] {
         let id = ok(
             &rw,
             "upsert_object",
@@ -1015,9 +1016,10 @@ async fn nearest_and_what_is_at_list_the_nearest_first() {
         )
         .await["id"]
             .clone();
-        lights.push(id);
+        ids.push(id);
     }
-    let nearest_first = [lights[1].clone(), lights[0].clone()];
+    let [a, c, b] = ids.try_into().expect("three lights");
+    let nearest_first = [b, c, a];
     let found = ok(
         &rw,
         "nearest",
@@ -1055,13 +1057,17 @@ async fn list_files_keeps_to_what_a_file_is_linked_to() {
     )
     .await["id"]
         .clone();
-    // Each file is linked to one thing only, and one to nothing at all.
+    ok(
+        &rw,
+        "upload_file",
+        json!({"name": "loose.txt", "text": "loose", "reason": "test"}),
+    )
+    .await;
     let links = [
         ("site.txt", json!({"site_id": site})),
         ("floor.txt", json!({"floor_id": floor})),
         ("space.txt", json!({"space_id": space})),
         ("object.txt", json!({"object_id": object})),
-        ("loose.txt", json!({})),
     ];
     for (name, link) in &links {
         ok(
@@ -1071,7 +1077,7 @@ async fn list_files_keeps_to_what_a_file_is_linked_to() {
         )
         .await;
     }
-    for (name, link) in &links[..4] {
+    for (name, link) in &links {
         let files = ok(&rw, "list_files", link.clone()).await;
         assert_eq!(column(&files, "name"), [json!(name)], "list_files by {link}");
     }
@@ -1104,7 +1110,7 @@ async fn geojson_names_are_trimmed_counted_in_characters_and_cut_with_their_part
         let created = ok(
             &rw,
             "import_geojson",
-            json!({"site_id": site, "geojson": named_feature(geometry, name), "as": "space", "kind": "garden_bed",
+            json!({"site_id": site, "geojson": named_feature(geometry, &name), "as": "space", "kind": "garden_bed",
                    "name_property": "name", "reason": "test"}),
         )
         .await;
@@ -1113,32 +1119,45 @@ async fn geojson_names_are_trimmed_counted_in_characters_and_cut_with_their_part
 }
 
 #[tokio::test]
-async fn names_a_drawing_composes_are_cut_and_its_unit_is_stored() {
+async fn names_a_drawing_composes_are_numbered_and_cut_and_its_unit_is_stored() {
     let server = start().await;
     let rw = client(&server, RW).await;
     let (_, floor) = site_and_floor(&rw, "Drawing").await;
-    let (twice, once) = ("B".repeat(250), "C".repeat(250));
+    // Short names show the numbering; long ones show the cut, which takes the
+    // number with it.
+    let (long_twice, long_once) = ("B".repeat(250), "C".repeat(250));
     let long_layer = "L".repeat(250);
     let mut dxf = drawing(dxf::enums::Units::Feet);
-    for name in [&twice, &once] {
+    for name in [long_twice.as_str(), long_once.as_str(), "Lamp", "Single"] {
         dxf.add_block(dxf::Block {
-            name: name.clone(),
+            name: name.into(),
             ..Default::default()
         });
     }
-    for (block, x) in [(&twice, 1.0), (&twice, 2.0), (&once, 3.0)] {
+    let inserts = [
+        (long_twice.as_str(), 1.0),
+        (long_twice.as_str(), 2.0),
+        (long_once.as_str(), 3.0),
+        ("Lamp", 8.5),
+        ("Lamp", 10.5),
+        ("Single", 12.0),
+    ];
+    for (block, x) in inserts {
         dxf.add_entity(on_layer(
             "E-LIGHT",
             dxf::entities::EntityType::Insert(dxf::entities::Insert {
-                name: block.clone(),
+                name: block.into(),
                 location: dxf::Point::new(x, 1.0, 0.0),
                 ..Default::default()
             }),
         ));
     }
-    // One room with no text inside, and one with a long label.
+    // On the long layer one room with no text inside and one with a long
+    // label; on the short layer two rooms with no text.
     dxf.add_entity(on_layer(&long_layer, rectangle(0.0, 0.0, 3.0, 3.0)));
     dxf.add_entity(on_layer(&long_layer, rectangle(4.0, 0.0, 7.0, 3.0)));
+    dxf.add_entity(on_layer("R", rectangle(8.0, 0.0, 9.0, 3.0)));
+    dxf.add_entity(on_layer("R", rectangle(10.0, 0.0, 11.0, 3.0)));
     dxf.add_entity(on_layer(
         "A-TEXT",
         dxf::entities::EntityType::Text(dxf::entities::Text {
@@ -1155,21 +1174,32 @@ async fn names_a_drawing_composes_are_cut_and_its_unit_is_stored() {
     )
     .await["sha256"]
         .clone();
-    let layers = json!({ "E-LIGHT": {"object": "light"}, long_layer: {"space": "room"} });
+    let layers = json!({ "E-LIGHT": {"object": "light"}, long_layer: {"space": "room"}, "R": {"space": "room"} });
     let import = ok(
         &rw,
         "import_dxf",
         json!({"file_sha256": sha, "floor_id": floor, "layers": layers, "reason": "test"}),
     )
     .await;
-    // Two copies of one block are numbered and a single copy is not, a space
-    // with no text inside is named by its layer and one with text by the
-    // text; every name is cut at 200 characters.
+    // Copies of a block used more than once are numbered and a single copy
+    // is not; a space with no text inside is named by its layer and its place
+    // among the drawing's outlines, here the third and fourth, and one with
+    // text by the text; every name is cut at 200 characters.
     assert_eq!(
         sorted_names(&import, "objects"),
-        ["B".repeat(200), "B".repeat(200), "C".repeat(200)]
+        [
+            "B".repeat(200),
+            "B".repeat(200),
+            "C".repeat(200),
+            "Lamp 1".into(),
+            "Lamp 2".into(),
+            "Single".into()
+        ]
     );
-    assert_eq!(sorted_names(&import, "spaces"), ["L".repeat(200), "T".repeat(200)]);
+    assert_eq!(
+        sorted_names(&import, "spaces"),
+        ["L".repeat(200), "R 3".into(), "R 4".into(), "T".repeat(200)]
+    );
     let unit: String = sqlx::query_scalar("SELECT unit FROM dxf_import WHERE id = $1")
         .bind(import["import_id"].as_i64().expect("import id"))
         .fetch_one(&mut server.db.qgis().await)
@@ -1185,7 +1215,7 @@ async fn a_site_without_a_georeference_refuses_geographic_input() {
     let bare = ok(&rw, "create_site", json!({"name": "Bare", "reason": "test"})).await["id"]
         .as_i64()
         .expect("site id");
-    let parcel = named_feature(json!({"type": "Polygon", "coordinates": square(9.0)}), "x".into());
+    let parcel = named_feature(json!({"type": "Polygon", "coordinates": square(9.0)}), "x");
     let error = call(
         &rw,
         "import_geojson",

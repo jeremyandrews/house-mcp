@@ -84,13 +84,11 @@ impl View {
         // A plan of a single point still needs a window around it.
         let dx = (extent.xmax - extent.xmin).max(1.0);
         let dy = (extent.ymax - extent.ymin).max(1.0);
-        let (scale, width, height) = if dx >= dy {
-            let scale = (long_side - 2.0 * MARGIN - NORTH_COLUMN) / dx;
-            (scale, long_side, dy * scale + 2.0 * MARGIN + FOOTER)
-        } else {
-            let scale = (long_side - 2.0 * MARGIN - FOOTER) / dy;
-            (scale, dx * scale + 2.0 * MARGIN + NORTH_COLUMN, long_side)
-        };
+        // The scale is whichever of the width and the height fits the long
+        // side first, so neither side of the image passes it.
+        let scale = ((long_side - 2.0 * MARGIN - NORTH_COLUMN) / dx).min((long_side - 2.0 * MARGIN - FOOTER) / dy);
+        let width = dx * scale + 2.0 * MARGIN + NORTH_COLUMN;
+        let height = dy * scale + 2.0 * MARGIN + FOOTER;
         Self {
             xmin: extent.xmin,
             ymax: extent.ymax,
@@ -136,13 +134,7 @@ fn svg(plan: &Plan, view: &View) -> Result<String, String> {
     for feature in &features {
         draw_feature(&mut out, feature, view)?;
     }
-    open_label_clip(&mut out, view);
-    for feature in &features {
-        if let Some(label) = &feature.label {
-            draw_label(&mut out, label, &feature.style, view);
-        }
-    }
-    out.push_str("</g>");
+    draw_labels(&mut out, &features, view);
     draw_scale_bar(&mut out, view);
     draw_north_arrow(&mut out, view, plan.rotation);
     let _ = write!(
@@ -187,25 +179,34 @@ fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), 
     Ok(())
 }
 
-/// Opens a group that clips labels out of the square the north arrow turns
-/// in. A label is as long as its name, so one that starts near the plan's
-/// right edge would otherwise run under the arrow.
-fn open_label_clip(out: &mut String, view: &View) {
-    let arrow_left = view.width - MARGIN - ARROW_REACH;
-    let arrow_bottom = ARROW_Y + ARROW_REACH;
+/// Draws every label in a group that clips them out of the square the north
+/// arrow turns in. A label is as long as its name, so one that starts near
+/// the plan's right edge would otherwise run under the arrow. The clip's id
+/// carries the image size, so two plans inlined in one page do not share a
+/// clip unless they share its shape too.
+fn draw_labels(out: &mut String, features: &[&Feature], view: &View) {
+    let (w, h) = (view.width.round(), view.height.round());
+    let id = format!("house-plan-labels-{w}x{h}");
     let _ = write!(
         out,
         concat!(
-            r#"<clipPath id="labels">"#,
-            r#"<rect width="{arrow_left:.2}" height="{h:.2}"/>"#,
-            r#"<rect y="{arrow_bottom:.2}" width="{w:.2}" height="{h:.2}"/>"#,
-            r#"</clipPath><g clip-path="url(#labels)">"#,
+            r#"<clipPath id="{id}">"#,
+            r#"<rect width="{arrow_left:.2}" height="{h}"/>"#,
+            r#"<rect y="{arrow_bottom:.2}" width="{w}" height="{h}"/>"#,
+            r#"</clipPath><g clip-path="url(#{id})">"#,
         ),
-        arrow_left = arrow_left,
-        arrow_bottom = arrow_bottom,
-        w = view.width,
-        h = view.height,
+        id = id,
+        arrow_left = view.width - MARGIN - ARROW_REACH,
+        arrow_bottom = ARROW_Y + ARROW_REACH,
+        w = w,
+        h = h,
     );
+    for feature in features {
+        if let Some(label) = &feature.label {
+            draw_label(out, label, &feature.style, view);
+        }
+    }
+    out.push_str("</g>");
 }
 
 fn draw_label(out: &mut String, label: &Label, style: &Style, view: &View) {

@@ -83,7 +83,7 @@ Importing the same file content onto the same floor again marks the earlier impo
 | --- | --- |
 | MCP request body | 36 MiB |
 | file through a tool call | 25 MiB |
-| file through HTTP | 100 MiB |
+| request body through HTTP, which for an upload is the file | 100 MiB plus 64 KiB |
 | stored file an import reads (DXF or GeoJSON) | 16 MiB |
 | DXF entities, counting every copy a block expands to | 100,000 |
 | DXF vertices, counted the same way | 2,000,000 |
@@ -111,7 +111,7 @@ Files are stored on the volume under their sha256 and are only ever addressed by
 | --- | --- | --- |
 | `DATABASE_URL` | | the `house` role's connection string |
 | `HOUSE_TOKEN_RW`, `HOUSE_TOKEN_RW_NAME` | | the read and write token, at least 32 characters, and the author name its changes carry |
-| `HOUSE_TOKEN_RO`, `HOUSE_TOKEN_RO_NAME` | | the read only token and its name |
+| `HOUSE_TOKEN_RO`, `HOUSE_TOKEN_RO_NAME` | | the read only token, also at least 32 characters and different from the other, and its name |
 | `HOUSE_FILES_DIR` | `/data/files` | where files are stored |
 | `HOUSE_LISTEN` | `0.0.0.0:8080` | the address to listen on |
 | `HOUSE_ALLOWED_HOSTS` | `house.pozza,localhost,127.0.0.1` | host names the MCP endpoint answers to, comma separated |

@@ -585,7 +585,7 @@ async fn awkward_input_is_refused_or_survived() {
     let found = ok(&rw, "search_notes", json!({"query": "garage"})).await;
     assert_eq!(found[0]["id"], note);
 
-    // A note inside a room longer than a name may be still names it, cut short.
+    // A text inside a room, longer than a name may be, still names it, cut short.
     let mut drawing = common::drawing(dxf::enums::Units::Meters);
     drawing.add_entity(common::on_layer("A-ROOM", common::rectangle(0.0, 0.0, 4.0, 3.0)));
     drawing.add_entity(common::on_layer(

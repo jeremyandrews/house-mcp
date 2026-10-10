@@ -446,7 +446,7 @@ fn arc_with_absurd_angles_is_drawn_in_one_turn() {
 
 #[test]
 fn repeated_long_polylines_stop_at_the_vertex_limit() {
-    // 300 copies of a 10,000 vertex polyline is 300 entities but three
+    // 300 copies of a 10,000 vertex polyline is 600 entities but three
     // million points.
     let mut drawing = drawing(Units::Meters);
     let mut long = LwPolyline::default();

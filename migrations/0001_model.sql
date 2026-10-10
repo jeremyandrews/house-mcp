@@ -8,8 +8,9 @@ CREATE TABLE site (
     name        text NOT NULL CHECK (name <> '' AND length(name) <= 200),
     -- The site frame's origin in WGS 84 / UTM zone 32N. Null until someone
     -- georeferences the site; the frame functions refuse such a site. It must
-    -- lie in the zone's northern half, or every later conversion of it fails,
-    -- list_sites included, whichever client stored it.
+    -- lie within the zone's northern extent: far outside it a conversion can
+    -- fail outright, and such an origin would break list_sites whichever
+    -- client stored it.
     origin      geometry(Point, 32632)
                 CONSTRAINT site_origin_in_zone
                 CHECK (origin IS NULL OR ST_Covers(ST_MakeEnvelope(166000, 0, 834000, 9330000, 32632), origin)),

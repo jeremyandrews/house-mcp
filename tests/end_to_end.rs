@@ -149,7 +149,7 @@ async fn end_to_end() {
         .as_i64()
         .expect("floor id");
 
-    // The drawing goes in as a file, then onto the floor.
+    // import_dxf reads only a stored file, so the drawing is uploaded first.
     let dxf = two_room_dxf();
     let file = ok(
         &rw,

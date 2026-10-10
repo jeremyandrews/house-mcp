@@ -14,13 +14,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::units::LengthUnit;
+use crate::{geom::MAX_VERTICES, units::LengthUnit};
 
 /// Entities read, counting every copy an INSERT expands to. Bounds the work a
 /// drawing of deeply repeated blocks can cause.
 pub const MAX_ENTITIES: usize = 100_000;
+/// Vertices across the whole drawing. A block of long polylines inserted many
+/// times stays under the entity limit while multiplying its points, so the
+/// points are counted too.
+pub const MAX_TOTAL_VERTICES: usize = 2_000_000;
 pub const MAX_BLOCK_DEPTH: usize = 16;
-pub const MAX_VERTICES: usize = 10_000;
 /// Arcs and circles are stored as line strings with a segment per this many
 /// degrees.
 const ARC_STEP_DEGREES: f64 = 5.0;
@@ -77,6 +80,7 @@ pub enum ImportError {
     Unreadable(String),
     NoUnits,
     TooManyEntities,
+    TooManyVertices,
     TooDeep(String),
     SelfReference(String),
 }
@@ -90,6 +94,7 @@ impl std::fmt::Display for ImportError {
                 "the drawing's $INSUNITS header names no length unit; pass `unit` to say what the drawing is measured in"
             ),
             Self::TooManyEntities => write!(f, "the drawing expands to more than {MAX_ENTITIES} entities"),
+            Self::TooManyVertices => write!(f, "the drawing expands to more than {MAX_TOTAL_VERTICES} vertices"),
             Self::TooDeep(block) => write!(f, "block `{block}` nests deeper than {MAX_BLOCK_DEPTH} levels"),
             Self::SelfReference(block) => write!(f, "block `{block}` inserts itself"),
         }
@@ -162,6 +167,7 @@ pub fn parse(bytes: &[u8], options: &Options) -> Result<Parsed, ImportError> {
         blocks,
         targets,
         visited: 0,
+        vertices: 0,
         stack: Vec::new(),
         out: Parsed {
             unit,
@@ -192,8 +198,16 @@ struct Reader<'a> {
     blocks: HashMap<&'a str, &'a dxf::Block>,
     targets: HashMap<String, &'a LayerTarget>,
     visited: usize,
+    vertices: usize,
     stack: Vec<&'a str>,
     out: Parsed,
+}
+
+/// What an entity contributes to the linework, before it is counted and
+/// checked.
+enum Shape {
+    Point((f64, f64)),
+    Line(Vec<(f64, f64)>),
 }
 
 impl<'a> Reader<'a> {
@@ -210,8 +224,34 @@ impl<'a> Reader<'a> {
         *self.out.skipped.entry(key).or_default() += 1;
     }
 
-    fn push_linework(&mut self, layer: &str, entity: &'static str, geometry: Value, text: Option<(String, f64)>) {
+    /// Counts the shape's vertices against the drawing's limit, and skips a
+    /// shape whose coordinates overflowed: huge scales or coordinates in a
+    /// file end up as infinities, which GeoJSON cannot carry. Returns whether
+    /// the shape was kept.
+    fn push_linework(
+        &mut self,
+        layer: &str,
+        entity: &'static str,
+        shape: &Shape,
+        text: Option<(String, f64)>,
+    ) -> Result<bool, ImportError> {
+        let points = match shape {
+            Shape::Point(point) => std::slice::from_ref(point),
+            Shape::Line(points) => points.as_slice(),
+        };
+        self.vertices += points.len();
+        if self.vertices > MAX_TOTAL_VERTICES {
+            return Err(ImportError::TooManyVertices);
+        }
+        if !points.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
+            self.skip(layer, entity, "coordinates out of range");
+            return Ok(false);
+        }
         self.out.layers.entry(layer.to_owned()).or_default().entities += 1;
+        let geometry = match shape {
+            Shape::Point(point) => point_json(*point),
+            Shape::Line(points) => line_string(points),
+        };
         let (text, text_height) = match text {
             Some((value, height)) => (Some(value), Some(height)),
             None => (None, None),
@@ -223,6 +263,7 @@ impl<'a> Reader<'a> {
             text,
             text_height,
         });
+        Ok(true)
     }
 
     /// `inherited` is the layer an entity on layer "0" takes, which is how a
@@ -236,53 +277,96 @@ impl<'a> Reader<'a> {
             "0" => inherited.to_owned(),
             own => own.to_owned(),
         };
+        let name = entity_name(&entity.specific);
         match &entity.specific {
             EntityType::Line(line) => {
                 let points = vec![at.apply(line.p1.x, line.p1.y), at.apply(line.p2.x, line.p2.y)];
-                self.push_linework(&layer, "LINE", line_string(&points), None);
+                self.push_linework(&layer, name, &Shape::Line(points), None)?;
             }
             EntityType::LwPolyline(poly) => {
+                let Some(at) = self.in_ocs(&layer, name, &poly.extrusion_direction, at) else {
+                    return Ok(());
+                };
                 let vertices: Vec<_> = poly.vertices.iter().map(|v| (v.x, v.y, v.bulge)).collect();
-                self.polyline(&layer, "LWPOLYLINE", &vertices, poly.is_closed(), at);
+                self.polyline(&layer, name, &vertices, poly.is_closed(), &at)?;
             }
             EntityType::Polyline(poly) => {
                 // Bit 16 is a 3D mesh and bit 64 a polyface mesh; neither is a
                 // plan outline.
                 if poly.flags & (16 | 64) != 0 {
-                    self.skip(&layer, "POLYLINE", "mesh, not a plan outline");
-                } else {
-                    let vertices: Vec<_> = poly.vertices().map(|v| (v.location.x, v.location.y, v.bulge)).collect();
-                    self.polyline(&layer, "POLYLINE", &vertices, poly.is_closed(), at);
+                    self.skip(&layer, name, "mesh, not a plan outline");
+                    return Ok(());
                 }
+                let Some(at) = self.in_ocs(&layer, name, &poly.normal, at) else {
+                    return Ok(());
+                };
+                let vertices: Vec<_> = poly.vertices().map(|v| (v.location.x, v.location.y, v.bulge)).collect();
+                self.polyline(&layer, name, &vertices, poly.is_closed(), &at)?;
             }
             EntityType::Arc(arc) => {
-                let mut end = arc.end_angle;
-                while end <= arc.start_angle {
+                if ![arc.start_angle, arc.end_angle, arc.radius]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    self.skip(&layer, name, "angle or radius out of range");
+                    return Ok(());
+                }
+                let Some(at) = self.in_ocs(&layer, name, &arc.normal, at) else {
+                    return Ok(());
+                };
+                // Normalising both angles bounds the sweep to one turn, however
+                // large the numbers in the file.
+                let start = arc.start_angle.rem_euclid(360.0);
+                let mut end = arc.end_angle.rem_euclid(360.0);
+                if end <= start {
                     end += 360.0;
                 }
-                let points = arc_points(arc.center.x, arc.center.y, arc.radius, arc.start_angle, end);
-                self.push_linework(&layer, "ARC", line_string(&at.apply_all(&points)), None);
+                let points = arc_points(arc.center.x, arc.center.y, arc.radius, start, end);
+                self.push_linework(&layer, name, &Shape::Line(at.apply_all(&points)), None)?;
             }
             EntityType::Circle(circle) => {
+                if !circle.radius.is_finite() {
+                    self.skip(&layer, name, "angle or radius out of range");
+                    return Ok(());
+                }
+                let Some(at) = self.in_ocs(&layer, name, &circle.normal, at) else {
+                    return Ok(());
+                };
                 let points = arc_points(circle.center.x, circle.center.y, circle.radius, 0.0, 360.0);
-                self.push_linework(&layer, "CIRCLE", line_string(&at.apply_all(&points)), None);
+                self.push_linework(&layer, name, &Shape::Line(at.apply_all(&points)), None)?;
             }
             EntityType::Text(text) => {
                 let point = at.apply(text.location.x, text.location.y);
                 let height = text.text_height * at.scale();
-                self.push_linework(&layer, "TEXT", point_json(point), Some((text.value.clone(), height)));
+                self.push_linework(&layer, name, &Shape::Point(point), Some((text.value.clone(), height)))?;
             }
             EntityType::MText(text) => {
                 let point = at.apply(text.insertion_point.x, text.insertion_point.y);
                 let mut raw = text.extended_text.concat();
                 raw.push_str(&text.text);
                 let height = text.initial_text_height * at.scale();
-                self.push_linework(&layer, "MTEXT", point_json(point), Some((plain_mtext(&raw), height)));
+                self.push_linework(&layer, name, &Shape::Point(point), Some((plain_mtext(&raw), height)))?;
             }
             EntityType::Insert(insert) => self.insert(insert, &layer, at)?,
-            other => self.skip(&layer, entity_name(other), "entity type not read"),
+            _ => self.skip(&layer, name, "entity type not read"),
         }
         Ok(())
+    }
+
+    /// The map for an entity drawn in its own coordinate system. A plan
+    /// entity's normal is +Z, where that system is the drawing's own, or -Z,
+    /// which CAD programs write for a mirrored copy and which flips x. Any
+    /// other normal puts the entity out of the plan, so it is skipped.
+    fn in_ocs(&mut self, layer: &str, entity: &str, normal: &dxf::Vector, at: &Affine) -> Option<Affine> {
+        let flat = normal.x.abs() < 1e-9 && normal.y.abs() < 1e-9;
+        match (flat, normal.z) {
+            (true, z) if z > 0.0 => Some(*at),
+            (true, z) if z < 0.0 => Some(at.then(&Affine::MIRROR_X)),
+            _ => {
+                self.skip(layer, entity, "extrusion is not along the z axis");
+                None
+            }
+        }
     }
 
     fn insert(&mut self, insert: &'a dxf::entities::Insert, layer: &str, at: &Affine) -> Result<(), ImportError> {
@@ -299,14 +383,18 @@ impl<'a> Reader<'a> {
         }
         let placed = at.then(&Affine::insert(insert, &block.base_point));
         if let Some(LayerTarget::Object(kind)) = self.target(layer) {
-            let point = at.apply(insert.location.x, insert.location.y);
-            self.out.layers.entry(layer.to_owned()).or_default().objects += 1;
-            self.out.objects.push(ObjectCandidate {
-                layer: layer.to_owned(),
-                kind: kind.clone(),
-                block: name.to_owned(),
-                point: point_json(point),
-            });
+            let (x, y) = at.apply(insert.location.x, insert.location.y);
+            if x.is_finite() && y.is_finite() {
+                self.out.layers.entry(layer.to_owned()).or_default().objects += 1;
+                self.out.objects.push(ObjectCandidate {
+                    layer: layer.to_owned(),
+                    kind: kind.clone(),
+                    block: name.to_owned(),
+                    point: point_json((x, y)),
+                });
+            } else {
+                self.skip(layer, "INSERT", "coordinates out of range");
+            }
         }
         self.stack.push(name);
         for entity in &block.entities {
@@ -316,18 +404,30 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn polyline(&mut self, layer: &str, entity: &'static str, vertices: &[(f64, f64, f64)], closed: bool, at: &Affine) {
-        let mut points = polyline_points(vertices, closed);
+    fn polyline(
+        &mut self,
+        layer: &str,
+        entity: &'static str,
+        vertices: &[(f64, f64, f64)],
+        closed: bool,
+        at: &Affine,
+    ) -> Result<(), ImportError> {
+        let points = polyline_points(vertices, closed);
         if points.len() < 2 {
             self.skip(layer, entity, "fewer than two vertices");
-            return;
+            return Ok(());
         }
         if points.len() > MAX_VERTICES {
             self.skip(layer, entity, "more vertices than the limit");
-            return;
+            return Ok(());
         }
-        points = at.apply_all(&points);
-        self.push_linework(layer, entity, line_string(&points), None);
+        let shape = Shape::Line(at.apply_all(&points));
+        if !self.push_linework(layer, entity, &shape, None)? {
+            return Ok(());
+        }
+        let Shape::Line(points) = shape else {
+            return Ok(());
+        };
         if let Some(LayerTarget::Space(kind)) = self.target(layer) {
             if closed && points.len() >= 4 {
                 self.out.layers.entry(layer.to_owned()).or_default().spaces += 1;
@@ -340,6 +440,7 @@ impl<'a> Reader<'a> {
                 self.skip(layer, entity, "open polyline on a space layer");
             }
         }
+        Ok(())
     }
 }
 
@@ -355,6 +456,17 @@ struct Affine {
 }
 
 impl Affine {
+    /// x negated: the map from an entity coordinate system whose normal is
+    /// -Z into the drawing's own.
+    const MIRROR_X: Self = Self {
+        a: -1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 0.0,
+        e: 1.0,
+        f: 0.0,
+    };
+
     fn user(unit_metres: f64, t: &Transform) -> Self {
         let (sin, cos) = t.rotation.to_radians().sin_cos();
         let s = unit_metres * t.scale;
@@ -552,6 +664,29 @@ mod tests {
     fn negative_bulge_curves_the_other_way() {
         let points = bulge_points((0.0, 0.0), (2.0, 0.0), -1.0);
         assert!(points.iter().any(|&p| close(p, (1.0, 1.0))), "{points:?}");
+    }
+
+    #[test]
+    fn quarter_circle_bulge_turns_about_the_left_centre() {
+        // tan(22.5 degrees) is a quarter circle. Counterclockwise from (0,0)
+        // to (1,1) its centre is (0,1), on the left of the chord, and the
+        // arc passes (sin 45, 1 minus cos 45) halfway.
+        let points = bulge_points((0.0, 0.0), (1.0, 1.0), 2f64.sqrt() - 1.0);
+        assert!(
+            points.iter().all(|&(x, y)| (x.hypot(y - 1.0) - 1.0).abs() < 1e-9),
+            "{points:?}"
+        );
+        assert!(
+            points.windows(2).all(|w| w[1].0 > w[0].0 && w[1].1 > w[0].1),
+            "{points:?}"
+        );
+        let half = 45f64.to_radians();
+        let mid = (half.sin(), 1.0 - half.cos());
+        // Within one 5 degree step of the halfway point.
+        assert!(
+            points.iter().any(|&(x, y)| (x - mid.0).hypot(y - mid.1) < 0.09),
+            "{points:?}"
+        );
     }
 
     #[test]

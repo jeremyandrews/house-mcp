@@ -1,13 +1,14 @@
 //! An MCP server holding a spatial model of a house and its grounds in
 //! PostGIS.
 
-pub mod auth;
+mod auth;
 pub mod config;
 pub mod db;
 pub mod dxf_import;
 mod error;
-pub mod files;
+mod files;
 pub mod geom;
+mod markup;
 mod mcp;
 pub mod render;
 pub mod units;

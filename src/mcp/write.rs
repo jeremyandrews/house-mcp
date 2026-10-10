@@ -14,12 +14,11 @@ use serde_json::{Value, json};
 use sqlx::{PgConnection, PgPool};
 
 use super::{House, Kind, Links, json_result, reason, wkb, writer};
-use crate::{db, error, files::FileStore};
+use crate::{db, error, files::FileStore, geom::MAX_VERTICES};
 
 /// The largest file a tool call may carry. Larger files go through
 /// `POST /api/files`.
 pub const MAX_TOOL_FILE: usize = 25 * 1024 * 1024;
-pub const MAX_VERTICES: i32 = 10_000;
 const SPACE_KINDS: [&str; 6] = ["room", "terrace", "garden_bed", "pool", "parcel", "building"];
 
 /// The same statement for whichever table a [`Kind`] names. Every variant is
@@ -459,20 +458,26 @@ impl House {
         let author = &writer(&parts)?.name;
         let reason = reason(&p.reason)?;
         let bytes = match (p.text, p.base64) {
-            (Some(text), None) => text.into_bytes(),
+            (Some(text), None) => {
+                if text.len() > MAX_TOOL_FILE {
+                    return Err(error::invalid("text", "is larger than 25 MiB"));
+                }
+                text.into_bytes()
+            }
             (None, Some(encoded)) => {
                 if encoded.len() > MAX_TOOL_FILE.div_ceil(3) * 4 + 4 {
                     return Err(error::invalid("base64", "decodes to more than 25 MiB"));
                 }
-                STANDARD
+                let bytes = STANDARD
                     .decode(encoded.trim())
-                    .map_err(|e| error::invalid("base64", format!("not base64: {e}")))?
+                    .map_err(|e| error::invalid("base64", format!("not base64: {e}")))?;
+                if bytes.len() > MAX_TOOL_FILE {
+                    return Err(error::invalid("base64", "decodes to more than 25 MiB"));
+                }
+                bytes
             }
             _ => return Err(error::invalid("text", "give exactly one of text and base64")),
         };
-        if bytes.len() > MAX_TOOL_FILE {
-            return Err(error::invalid("text", "is larger than 25 MiB"));
-        }
         let stored = store_file(
             &self.db,
             &self.files,
@@ -546,7 +551,8 @@ impl House {
 }
 
 /// Puts back a row that a client removed outright, as it was just before the
-/// removal.
+/// removal but live: a row soft deleted before it was removed would otherwise
+/// come back still deleted.
 async fn restore_removed_row(tx: &mut PgConnection, kind: Kind, id: i64) -> Result<(), ErrorData> {
     let live: Option<i32> = sqlx::query_scalar(per_table!(kind, "SELECT 1 FROM ", " WHERE id = $1"))
         .bind(id)
@@ -570,7 +576,7 @@ async fn restore_removed_row(tx: &mut PgConnection, kind: Kind, id: i64) -> Resu
         kind,
         "INSERT INTO ",
         " OVERRIDING SYSTEM VALUE SELECT * FROM jsonb_populate_record(NULL::",
-        ", $1)"
+        ", $1 || '{\"deleted_at\": null}'::jsonb)"
     ))
     .bind(before)
     .execute(&mut *tx)
@@ -738,8 +744,8 @@ pub(super) async fn check_geometry(
     wkb: &[u8],
     allowed: &[&str],
 ) -> Result<(), ErrorData> {
-    let (kind, points, reason): (String, i32, Option<String>) = sqlx::query_as(
-        "SELECT GeometryType(g), ST_NPoints(g), CASE WHEN ST_IsValid(g) THEN NULL ELSE ST_IsValidReason(g) END
+    let (kind, points, empty, reason): (String, i32, bool, Option<String>) = sqlx::query_as(
+        "SELECT GeometryType(g), ST_NPoints(g), ST_IsEmpty(g), CASE WHEN ST_IsValid(g) THEN NULL ELSE ST_IsValidReason(g) END
          FROM ST_GeomFromWKB($1, 0) AS g",
     )
     .bind(wkb)
@@ -752,7 +758,10 @@ pub(super) async fn check_geometry(
             format!("is a {kind}; expected one of {}", allowed.join(", ")),
         ));
     }
-    if points > MAX_VERTICES {
+    if empty {
+        return Err(error::invalid(field, "is empty"));
+    }
+    if usize::try_from(points).unwrap_or(usize::MAX) > MAX_VERTICES {
         return Err(error::invalid(field, format!("has more than {MAX_VERTICES} vertices")));
     }
     if let Some(reason) = reason {

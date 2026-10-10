@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use common::{drawing, on_layer, rectangle, save, two_room_dxf};
 use dxf::{
     Block, Point,
-    entities::{Circle, Ellipse, Entity, EntityType, Insert, LwPolyline},
+    entities::{Arc, Circle, Ellipse, Entity, EntityType, Insert, Line, LwPolyline, Polyline, Vertex},
     enums::Units,
 };
 use house_mcp::{
@@ -225,9 +225,10 @@ fn repeated_blocks_stop_at_the_entity_limit() {
         ..Default::default()
     };
     for _ in 0..1000 {
-        inner
-            .entities
-            .push(Entity::new(EntityType::Circle(Circle::new(Point::origin(), 1.0))));
+        inner.entities.push(Entity::new(EntityType::Line(Line::new(
+            Point::origin(),
+            Point::new(1.0, 0.0, 0.0),
+        ))));
     }
     drawing.add_block(inner);
     let mut outer = Block {
@@ -258,8 +259,18 @@ fn open_outline_and_unread_entities_are_reported() {
     }
     drawing.add_entity(on_layer("A-ROOM", EntityType::LwPolyline(open)));
     drawing.add_entity(on_layer("A-ROOM", EntityType::Ellipse(Ellipse::default())));
+    let mut on_paper = on_layer("A-ROOM", rectangle(0.0, 0.0, 1.0, 1.0));
+    on_paper.common.is_in_paper_space = true;
+    drawing.add_entity(on_paper);
+    let mesh = Polyline {
+        flags: 16,
+        ..Default::default()
+    };
+    drawing.add_entity(on_layer("A-ROOM", EntityType::Polyline(mesh)));
     let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
     assert!(parsed.spaces.is_empty());
+    // The open outline is the only linework; the rest were skipped.
+    assert_eq!(parsed.linework.len(), 1);
     let reasons: Vec<_> = parsed
         .skipped
         .keys()
@@ -269,7 +280,9 @@ fn open_outline_and_unread_entities_are_reported() {
         reasons,
         vec![
             ("ELLIPSE", "entity type not read"),
-            ("LWPOLYLINE", "open polyline on a space layer")
+            ("LWPOLYLINE", "in paper space, not model space"),
+            ("LWPOLYLINE", "open polyline on a space layer"),
+            ("POLYLINE", "mesh, not a plan outline"),
         ]
     );
 }
@@ -287,4 +300,166 @@ fn insert(name: &str) -> EntityType {
         name: name.into(),
         ..Default::default()
     })
+}
+
+/// A 4 by 3 metre room whose east wall bows out as a half circle: the
+/// vertex at (4, 0) carries a bulge of 1, so the arc to (4, 3) runs
+/// counterclockwise round the centre (4, 1.5) through (5.5, 1.5).
+const BULGED_ROOM: [(f64, f64, f64); 4] = [(0.0, 0.0, 0.0), (4.0, 0.0, 1.0), (4.0, 3.0, 0.0), (0.0, 3.0, 0.0)];
+
+fn assert_bulged_room(parsed: &Parsed) {
+    assert_eq!(parsed.spaces.len(), 1);
+    let ring = parsed.spaces[0].polygon["coordinates"][0].as_array().expect("ring");
+    assert!(ring.len() > 5, "the bulge adds points: {ring:?}");
+    let points: Vec<(f64, f64)> = ring
+        .iter()
+        .map(|p| (p[0].as_f64().expect("x"), p[1].as_f64().expect("y")))
+        .collect();
+    assert!(
+        points
+            .iter()
+            .any(|&(x, y)| (x - 5.5).abs() < 1e-9 && (y - 1.5).abs() < 1e-9),
+        "{points:?}"
+    );
+    assert!(points.iter().all(|&(x, _)| x <= 5.5 + 1e-9));
+}
+
+#[test]
+fn lwpolyline_bulge_becomes_an_arc_in_the_outline() {
+    let mut drawing = drawing(Units::Meters);
+    let mut room = LwPolyline::default();
+    for (x, y, bulge) in BULGED_ROOM {
+        room.vertices.push(dxf::LwPolylineVertex {
+            x,
+            y,
+            bulge,
+            ..Default::default()
+        });
+    }
+    room.set_is_closed(true);
+    drawing.add_entity(on_layer("A-ROOM", EntityType::LwPolyline(room)));
+    assert_bulged_room(&parse(&save(&drawing), &options(None, Transform::default())).expect("reads"));
+}
+
+#[test]
+fn old_polyline_bulge_becomes_an_arc_in_the_outline() {
+    let mut drawing = drawing(Units::Meters);
+    let mut room = Polyline::default();
+    for (x, y, bulge) in BULGED_ROOM {
+        let mut vertex = Vertex::new(Point::new(x, y, 0.0));
+        vertex.bulge = bulge;
+        room.add_vertex(&mut drawing, vertex);
+    }
+    room.set_is_closed(true);
+    drawing.add_entity(on_layer("A-ROOM", EntityType::Polyline(room)));
+    assert_bulged_room(&parse(&save(&drawing), &options(None, Transform::default())).expect("reads"));
+}
+
+fn coordinates(geometry: &serde_json::Value) -> Vec<(f64, f64)> {
+    geometry["coordinates"]
+        .as_array()
+        .expect("coordinates")
+        .iter()
+        .map(|p| (p[0].as_f64().expect("x"), p[1].as_f64().expect("y")))
+        .collect()
+}
+
+fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+}
+
+#[test]
+fn line_and_wrapping_arc_are_drawn_where_they_are() {
+    let mut drawing = drawing(Units::Meters);
+    drawing.add_entity(on_layer(
+        "A-WALL",
+        EntityType::Line(Line::new(Point::new(1.0, 2.0, 0.0), Point::new(3.0, 4.0, 0.0))),
+    ));
+    // From 270 to 90 degrees counterclockwise passes through 0, on the
+    // right of the centre.
+    drawing.add_entity(on_layer(
+        "A-WALL",
+        EntityType::Arc(Arc::new(Point::origin(), 1.0, 270.0, 90.0)),
+    ));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    let line = parsed.linework.iter().find(|l| l.entity == "LINE").expect("line");
+    assert_eq!(
+        line.geometry,
+        json!({"type": "LineString", "coordinates": [[1.0, 2.0], [3.0, 4.0]]})
+    );
+    let arc = coordinates(
+        &parsed
+            .linework
+            .iter()
+            .find(|l| l.entity == "ARC")
+            .expect("arc")
+            .geometry,
+    );
+    assert!(near(arc[0], (0.0, -1.0)), "{arc:?}");
+    assert!(near(arc[arc.len() - 1], (0.0, 1.0)), "{arc:?}");
+    assert!(arc.iter().any(|&p| near(p, (1.0, 0.0))), "{arc:?}");
+    assert!(arc.iter().all(|&(x, _)| x > -1e-9), "{arc:?}");
+}
+
+#[test]
+fn arc_with_a_downward_normal_is_mirrored() {
+    // A normal of -Z flips the entity's own x axis: the arc drawn from 0 to
+    // 90 degrees round (2, 0) lands round (-2, 0), from (-3, 0) to (-2, 1).
+    let mut drawing = drawing(Units::Meters);
+    let mut arc = Arc::new(Point::new(2.0, 0.0, 0.0), 1.0, 0.0, 90.0);
+    arc.normal = dxf::Vector::new(0.0, 0.0, -1.0);
+    drawing.add_entity(on_layer("A-WALL", EntityType::Arc(arc)));
+    let mut tilted = Arc::new(Point::origin(), 1.0, 0.0, 90.0);
+    tilted.normal = dxf::Vector::new(1.0, 0.0, 0.0);
+    drawing.add_entity(on_layer("A-WALL", EntityType::Arc(tilted)));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    assert_eq!(parsed.linework.len(), 1);
+    let arc = coordinates(&parsed.linework[0].geometry);
+    assert!(near(arc[0], (-3.0, 0.0)), "{arc:?}");
+    assert!(near(arc[arc.len() - 1], (-2.0, 1.0)), "{arc:?}");
+    let reasons: Vec<_> = parsed.skipped.keys().map(|s| s.reason.as_str()).collect();
+    assert_eq!(reasons, ["extrusion is not along the z axis"]);
+}
+
+#[test]
+fn arc_with_absurd_angles_is_drawn_in_one_turn() {
+    // Angles far past one turn are read modulo 360, so the sweep stays
+    // bounded: 720 + 0 to 1e12 degrees is 0 to 280 here.
+    let mut drawing = drawing(Units::Meters);
+    drawing.add_entity(on_layer(
+        "A-WALL",
+        EntityType::Arc(Arc::new(Point::origin(), 1.0, 720.0, 1e12)),
+    ));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    let arc = coordinates(&parsed.linework[0].geometry);
+    assert!(arc.len() <= 73, "{}", arc.len());
+    assert!(near(arc[0], (1.0, 0.0)), "{arc:?}");
+}
+
+#[test]
+fn repeated_long_polylines_stop_at_the_vertex_limit() {
+    // 300 copies of a 10,000 vertex polyline is 300 entities but three
+    // million points.
+    let mut drawing = drawing(Units::Meters);
+    let mut long = LwPolyline::default();
+    for i in 0..10_000 {
+        long.vertices.push(dxf::LwPolylineVertex {
+            x: f64::from(i),
+            y: 0.0,
+            ..Default::default()
+        });
+    }
+    let mut block = Block {
+        name: "LONG".into(),
+        ..Default::default()
+    };
+    block.entities.push(Entity::new(EntityType::LwPolyline(long)));
+    drawing.add_block(block);
+    for _ in 0..300 {
+        drawing.add_entity(Entity::new(insert("LONG")));
+    }
+    let error = parse(&save(&drawing), &options(None, Transform::default()))
+        .err()
+        .expect("refused");
+    assert!(matches!(error, ImportError::TooManyVertices), "{error}");
 }

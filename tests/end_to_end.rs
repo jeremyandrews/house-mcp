@@ -515,3 +515,100 @@ async fn plain_http_routes() {
         same.status()
     );
 }
+
+#[tokio::test]
+async fn awkward_input_is_refused_or_survived() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let site = ok(&rw, "create_site", json!({"name": "Edge", "reason": "test"})).await["id"]
+        .as_i64()
+        .expect("site id");
+    let floor = ok(
+        &rw,
+        "upsert_floor",
+        json!({"site_id": site, "name": "Ground", "level": 0, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("floor id");
+
+    // Empty geometry from a caller is refused by name.
+    let refused = call(
+        &rw,
+        "upsert_space",
+        json!({"site_id": site, "floor_id": floor, "name": "Nothing", "kind": "room",
+               "geometry": {"type": "Polygon", "coordinates": []}, "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("geometry: is empty"), "{refused}");
+
+    // QGIS can still store one; reading and drawing must survive it.
+    let mut qgis = PgConnection::connect_with(&server.db.options("house_qgis", QGIS_PASSWORD))
+        .await
+        .expect("qgis");
+    sqlx::query(
+        "INSERT INTO object (site_id, floor_id, kind, name, geom) VALUES ($1, $2, 'light', 'Ghost', 'MULTIPOINT EMPTY'),
+                                                                        ($1, $2, 'light', 'Real', ST_MakePoint(1, 1))",
+    )
+    .bind(site)
+    .bind(floor)
+    .execute(&mut qgis)
+    .await
+    .expect("insert");
+    let nearest = ok(
+        &rw,
+        "nearest",
+        json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
+    )
+    .await;
+    assert_eq!(nearest[0]["name"], "Real");
+    call(&rw, "render_plan", json!({"site_id": site, "floor_id": floor}))
+        .await
+        .expect("renders past an empty geometry");
+
+    // Soft deleted, then removed outright from QGIS: restore brings it back live.
+    let note = ok(
+        &rw,
+        "add_note",
+        json!({"body": "Meter in the garage", "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("note id");
+    ok(&rw, "delete", json!({"kind": "note", "id": note, "reason": "test"})).await;
+    sqlx::query("DELETE FROM note WHERE id = $1")
+        .bind(note)
+        .execute(&mut qgis)
+        .await
+        .expect("delete");
+    ok(&rw, "restore", json!({"kind": "note", "id": note, "reason": "test"})).await;
+    let found = ok(&rw, "search_notes", json!({"query": "garage"})).await;
+    assert_eq!(found[0]["id"], note);
+
+    // A note inside a room longer than a name may be still names it, cut short.
+    let mut drawing = common::drawing(dxf::enums::Units::Meters);
+    drawing.add_entity(common::on_layer("A-ROOM", common::rectangle(0.0, 0.0, 4.0, 3.0)));
+    drawing.add_entity(common::on_layer(
+        "A-TEXT",
+        dxf::entities::EntityType::Text(dxf::entities::Text {
+            location: dxf::Point::new(1.0, 1.0, 0.0),
+            text_height: 0.2,
+            value: "x".repeat(300),
+            ..Default::default()
+        }),
+    ));
+    let file = ok(
+        &rw,
+        "upload_file",
+        json!({"name": "long.dxf", "base64": STANDARD.encode(common::save(&drawing)), "reason": "test"}),
+    )
+    .await;
+    let import = ok(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "floor_id": floor, "layers": {"A-ROOM": {"space": "room"}}, "reason": "test"}),
+    )
+    .await;
+    assert_eq!(import["spaces"][0]["name"], "x".repeat(200));
+}

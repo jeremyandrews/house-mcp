@@ -85,6 +85,7 @@ Importing the same file content onto the same floor again marks the earlier impo
 | file through a tool call | 25 MiB |
 | file through HTTP | 100 MiB |
 | DXF entities, counting every copy a block expands to | 100,000 |
+| DXF vertices, counted the same way | 2,000,000 |
 | DXF block nesting | 16 levels; a block that inserts itself is refused |
 | vertices in one geometry | 10,000 |
 | GeoJSON features in one import | 10,000 |

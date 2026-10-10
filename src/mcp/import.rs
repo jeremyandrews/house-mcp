@@ -14,14 +14,14 @@ use sqlx::{PgConnection, Row};
 
 use super::{
     House, json_result, reason,
-    write::{MAX_VERTICES, check_epsg, check_space_kind, object_kind},
+    write::{check_epsg, check_space_kind, object_kind},
     writer,
 };
 use crate::{
     db,
     dxf_import::{self, LayerTarget, Parsed, Transform},
     error,
-    files::Sha256Hex,
+    geom::MAX_VERTICES,
     units::LengthUnit,
 };
 
@@ -101,10 +101,8 @@ impl House {
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
         check_epsg(&mut tx, "epsg", epsg).await?;
         let mut created = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            let ids = insert_feature(&mut tx, &p, epsg, row)
-                .await
-                .map_err(|e| error::invalid(&format!("features[{i}]"), e.message))?;
+        for row in &rows {
+            let ids = insert_feature(&mut tx, &p, epsg, row).await?;
             created.extend(
                 ids.into_iter()
                     .map(|id| json!({ "id": id, "name": row.name, "kind": row.kind })),
@@ -124,35 +122,23 @@ impl House {
     ) -> Result<CallToolResult, ErrorData> {
         let author = &writer(&parts)?.name;
         let reason = reason(&p.reason)?;
+        let mut layers = HashMap::with_capacity(p.layers.len());
         for (layer, target) in &p.layers {
             let field = format!("layers.{layer}");
-            match target {
-                LayerTarget::Space(kind) => check_space_kind(&field, kind)?,
-                LayerTarget::Object(kind) => {
-                    object_kind(&field, kind)?;
+            let target = match target {
+                LayerTarget::Space(kind) => {
+                    check_space_kind(&field, kind)?;
+                    LayerTarget::Space(kind.clone())
                 }
-            }
+                LayerTarget::Object(kind) => LayerTarget::Object(object_kind(&field, kind)?),
+            };
+            layers.insert(layer.clone(), target);
         }
         if !(p.transform.scale.is_finite() && p.transform.scale > 0.0) {
             return Err(error::invalid("transform.scale", "must be positive"));
         }
-        let sha = Sha256Hex::parse(&p.file_sha256)
-            .ok_or_else(|| error::invalid("file_sha256", "not a lowercase hex sha256"))?;
-        let file =
-            sqlx::query("SELECT id, name FROM file WHERE sha256 = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1")
-                .bind(sha.as_str())
-                .fetch_optional(&self.db)
-                .await
-                .map_err(error::db)?
-                .ok_or_else(|| error::invalid("file_sha256", "no live file with this hash"))?;
-        let file_id: i64 = file.get("id");
-        let name: String = file.get("name");
-        let bytes = self
-            .files
-            .get(&sha)
-            .await
-            .map_err(|e| error::internal("reading a file", e))?;
-        if is_dwg(&name, &bytes) {
+        let (file, bytes) = self.live_file_bytes("file_sha256", &p.file_sha256).await?;
+        if is_dwg(&file.name, &bytes) {
             return Err(error::invalid(
                 "file_sha256",
                 "is a DWG drawing, which this server does not read; convert it to DXF with the free ODA File Converter, upload the DXF and import that",
@@ -160,7 +146,7 @@ impl House {
         }
         let options = dxf_import::Options {
             unit: p.unit,
-            layers: p.layers.clone(),
+            layers: layers.clone(),
             transform: p.transform.clone(),
         };
         let parsed = tokio::task::spawn_blocking(move || dxf_import::parse(&bytes, &options))
@@ -175,20 +161,20 @@ impl House {
             .await
             .map_err(error::db)?
             .ok_or_else(|| error::invalid("floor_id", "no live floor with this id"))?;
-        let replaced = retire_previous_import(&mut tx, sha.as_str(), p.floor_id).await?;
+        let replaced = retire_previous_import(&mut tx, file.sha.as_str(), p.floor_id).await?;
         let summary = json!({
             "unit": parsed.unit,
             "unit_from": if parsed.unit_from_call { "call" } else { "$INSUNITS" },
             "layers": parsed.layers,
             "skipped": skipped_json(&parsed),
         });
-        let options = json!({ "layers": p.layers, "unit": p.unit, "transform": p.transform });
+        let options = json!({ "layers": layers, "unit": p.unit, "transform": p.transform });
         let import_id: i64 = sqlx::query_scalar(
             "INSERT INTO dxf_import (file_id, sha256, floor_id, unit, options, summary)
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
-        .bind(file_id)
-        .bind(sha.as_str())
+        .bind(file.id)
+        .bind(file.sha.as_str())
         .bind(p.floor_id)
         .bind(json!(parsed.unit).as_str().unwrap_or_default())
         .bind(&options)
@@ -213,21 +199,7 @@ impl House {
 
 impl House {
     async fn stored_json(&self, sha: &str) -> Result<Value, ErrorData> {
-        let sha = Sha256Hex::parse(sha).ok_or_else(|| error::invalid("file_sha256", "not a lowercase hex sha256"))?;
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM file WHERE sha256 = $1 AND deleted_at IS NULL)")
-                .bind(sha.as_str())
-                .fetch_one(&self.db)
-                .await
-                .map_err(error::db)?;
-        if !exists {
-            return Err(error::invalid("file_sha256", "no live file with this hash"));
-        }
-        let bytes = self
-            .files
-            .get(&sha)
-            .await
-            .map_err(|e| error::internal("reading a file", e))?;
+        let (_, bytes) = self.live_file_bytes("file_sha256", sha).await?;
         serde_json::from_slice(&bytes).map_err(|e| error::invalid("file_sha256", format!("not JSON: {e}")))
     }
 }
@@ -254,6 +226,8 @@ fn features(document: &Value) -> Result<Vec<&Value>, ErrorData> {
 }
 
 struct FeatureRow {
+    /// `features[i]`, so an error names the feature at fault.
+    field: String,
     name: String,
     kind: String,
     wkb: Vec<u8>,
@@ -285,7 +259,7 @@ fn feature_row(p: &ImportGeoJsonParams, i: usize, feature: &Value) -> Result<Fea
         .get("geometry")
         .ok_or_else(|| error::invalid(&field, "has no geometry"))?;
     let wkb = crate::geom::to_wkb(geometry).map_err(|e| error::invalid(&field, e))?;
-    Ok(FeatureRow { name, kind, wkb })
+    Ok(FeatureRow { field, name, kind, wkb })
 }
 
 /// One feature into the site frame and the model. A space takes each polygon
@@ -296,8 +270,8 @@ async fn insert_feature(
     epsg: i32,
     row: &FeatureRow,
 ) -> Result<Vec<i64>, ErrorData> {
-    let check: (i32, bool) = sqlx::query_as(
-        "SELECT ST_NPoints(g), ST_IsValid(g) FROM house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3) AS g",
+    let (points, empty, valid): (i32, bool, bool) = sqlx::query_as(
+        "SELECT ST_NPoints(g), ST_IsEmpty(g), ST_IsValid(g) FROM house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3) AS g",
     )
     .bind(&row.wkb)
     .bind(epsg)
@@ -305,14 +279,17 @@ async fn insert_feature(
     .fetch_one(&mut *tx)
     .await
     .map_err(error::db)?;
-    if check.0 > MAX_VERTICES {
+    if empty {
+        return Err(error::invalid(&row.field, "has an empty geometry"));
+    }
+    if usize::try_from(points).unwrap_or(usize::MAX) > MAX_VERTICES {
         return Err(error::invalid(
-            "geometry",
+            &row.field,
             format!("has more than {MAX_VERTICES} vertices"),
         ));
     }
-    if !check.1 {
-        return Err(error::invalid("geometry", "is not valid"));
+    if !valid {
+        return Err(error::invalid(&row.field, "has an invalid geometry"));
     }
     let sql = match p.target {
         FeatureTarget::Space => {
@@ -339,7 +316,7 @@ async fn insert_feature(
         .await
         .map_err(error::db)?;
     if ids.is_empty() {
-        return Err(error::invalid("geometry", "has no polygon to make a space from"));
+        return Err(error::invalid(&row.field, "has no polygon to make a space from"));
     }
     Ok(ids)
 }
@@ -429,11 +406,11 @@ async fn insert_spaces(
              FROM unnest($4::bytea[], $5::text[], $6::text[]) WITH ORDINALITY AS u(wkb, kind, layer, n)
          ), inserted AS (
              INSERT INTO space (site_id, floor_id, name, kind, geom, dxf_import_id)
-             SELECT $2, $3, coalesce(label.text, c.layer || ' ' || c.n), c.kind, c.geom, $1
+             SELECT $2, $3, coalesce(left(btrim(label.text), 200), c.layer || ' ' || c.n), c.kind, c.geom, $1
              FROM candidate c
              LEFT JOIN LATERAL (
                  SELECT l.text FROM linework l
-                 WHERE l.dxf_import_id = $1 AND l.deleted_at IS NULL AND l.text <> '' AND ST_Contains(c.geom, l.geom)
+                 WHERE l.dxf_import_id = $1 AND l.deleted_at IS NULL AND btrim(l.text) <> '' AND ST_Contains(c.geom, l.geom)
                  ORDER BY l.text_height DESC NULLS LAST, l.id LIMIT 1
              ) AS label ON true
              WHERE ST_IsValid(c.geom)
@@ -482,8 +459,7 @@ async fn insert_objects(
     let mut layers = Vec::new();
     for candidate in &parsed.objects {
         geometries.push(crate::geom::to_wkb(&candidate.point).map_err(|e| error::internal("encoding a point", e))?);
-        // Checked when the layer mapping was read.
-        kinds.push(object_kind("layers", &candidate.kind)?);
+        kinds.push(candidate.kind.as_str());
         blocks.push(candidate.block.as_str());
         layers.push(candidate.layer.as_str());
     }

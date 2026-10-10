@@ -29,7 +29,11 @@ use sqlx::PgPool;
 
 pub use write::{NewFile, store_file};
 
-use crate::{auth::Caller, error, files::FileStore};
+use crate::{
+    auth::Caller,
+    error,
+    files::{FileStore, Sha256Hex},
+};
 
 #[derive(Clone)]
 pub struct House {
@@ -157,6 +161,39 @@ pub struct Links {
     pub floor_id: Option<i64>,
     pub space_id: Option<i64>,
     pub object_id: Option<i64>,
+}
+
+/// The oldest live record of a file content.
+pub struct LiveFile {
+    pub sha: Sha256Hex,
+    pub id: i64,
+    pub name: String,
+}
+
+/// Finds the live record for a caller's sha256, refused naming `field` when
+/// the hash is malformed or no live record has it.
+pub async fn live_file(pool: &PgPool, field: &str, sha: &str) -> Result<LiveFile, ErrorData> {
+    let sha = Sha256Hex::parse(sha).ok_or_else(|| error::invalid(field, "not a lowercase hex sha256"))?;
+    let (id, name): (i64, String) =
+        sqlx::query_as("SELECT id, name FROM file WHERE sha256 = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1")
+            .bind(sha.as_str())
+            .fetch_optional(pool)
+            .await
+            .map_err(error::db)?
+            .ok_or_else(|| error::invalid(field, "no live file with this hash"))?;
+    Ok(LiveFile { sha, id, name })
+}
+
+impl House {
+    async fn live_file_bytes(&self, field: &str, sha: &str) -> Result<(LiveFile, Vec<u8>), ErrorData> {
+        let file = live_file(&self.db, field, sha).await?;
+        let bytes = self
+            .files
+            .get(&file.sha)
+            .await
+            .map_err(|e| error::internal("reading a file", e))?;
+        Ok((file, bytes))
+    }
 }
 
 fn json_result(value: impl Serialize) -> Result<CallToolResult, ErrorData> {

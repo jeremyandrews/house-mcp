@@ -4,6 +4,10 @@
 use geozero::{CoordDimensions, ToJson, ToWkb, geojson::GeoJson, wkb::Wkb};
 use serde_json::Value;
 
+/// The most vertices one geometry may have, whether a caller sends it or a
+/// drawing yields it.
+pub const MAX_VERTICES: usize = 10_000;
+
 /// GeoJSON geometry, as a caller sends it or PostGIS returns it, to WKB.
 pub fn to_wkb(geometry: &Value) -> Result<Vec<u8>, String> {
     if !geometry.is_object() {

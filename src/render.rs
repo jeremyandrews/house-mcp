@@ -9,6 +9,8 @@ use std::{fmt::Write as _, sync::Arc};
 use geozero::{GeomProcessor, GeozeroGeometry, wkb::Wkb};
 use resvg::{tiny_skia, usvg};
 
+use crate::markup::escape;
+
 pub const MIN_SIDE_PX: u32 = 200;
 pub const MAX_SIDE_PX: u32 = 4096;
 const MARGIN: f64 = 40.0;
@@ -270,13 +272,6 @@ fn kind_colour(kind: &str) -> String {
     format!("hsl({hue}, 65%, 42%)")
 }
 
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn rasterize(svg: &str) -> Result<Vec<u8>, String> {
     let mut options = usvg::Options::default();
     let fonts = Arc::make_mut(&mut options.fontdb);
@@ -383,10 +378,5 @@ mod tests {
         assert_eq!(round_length(1.4), 1.0);
         assert_eq!(round_length(0.6), 0.5);
         assert_eq!(round_length(240.0), 200.0);
-    }
-
-    #[test]
-    fn label_text_is_escaped() {
-        assert_eq!(escape(r#"<b>"A&B"</b>"#), "&lt;b&gt;&quot;A&amp;B&quot;&lt;/b&gt;");
     }
 }

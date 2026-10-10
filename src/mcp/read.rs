@@ -274,7 +274,7 @@ impl House {
                 "floor_id": r.get::<Option<i64>, _>("floor_id"),
                 "name": r.get::<String, _>("name"),
                 "kind": r.get::<String, _>("kind"),
-                "distance": r.get::<f64, _>("distance"),
+                "distance": r.get::<Option<f64>, _>("distance"),
             })).collect::<Vec<_>>(),
         }))
     }
@@ -362,7 +362,7 @@ impl House {
         let mut found = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut value = object_json(row)?;
-            value["distance"] = json!(row.get::<f64, _>("distance"));
+            value["distance"] = json!(row.get::<Option<f64>, _>("distance"));
             found.push(value);
         }
         json_result(found)
@@ -377,12 +377,13 @@ impl House {
         if let Some(b) = &p.b {
             let b = self.location("b", b).await?;
             result["b"] = self.shape_measures(&b).await?;
-            let distance: f64 = sqlx::query_scalar("SELECT ST_Distance(ST_GeomFromWKB($1, 0), ST_GeomFromWKB($2, 0))")
-                .bind(&a)
-                .bind(&b)
-                .fetch_one(&self.db)
-                .await
-                .map_err(error::db)?;
+            let distance: Option<f64> =
+                sqlx::query_scalar("SELECT ST_Distance(ST_GeomFromWKB($1, 0), ST_GeomFromWKB($2, 0))")
+                    .bind(&a)
+                    .bind(&b)
+                    .fetch_one(&self.db)
+                    .await
+                    .map_err(error::db)?;
             result["distance"] = json!(distance);
         }
         json_result(result)

@@ -156,3 +156,34 @@ fn labels_are_drawn_with_the_embedded_font() {
     assert!(dark_pixels_near_kitchen(&labelled) > 50);
     assert_eq!(dark_pixels_near_kitchen(&unlabelled), 0);
 }
+
+#[test]
+fn tall_plan_fits_the_long_side_with_room_for_the_footer() {
+    // 3 m wide and 9 m tall, with a room filling the bottom 3 m. The scale
+    // is (1600 - 80 - 50) / 9 pixels per metre, so the footer never covers
+    // the plan.
+    let room =
+        json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [0.0, 3.0], [0.0, 0.0]]]});
+    let outline = json!({"type": "LineString", "coordinates": [[0.0, 0.0], [3.0, 9.0]]});
+    let plan = Plan {
+        title: "Tall".into(),
+        rotation: 0.0,
+        extent: Extent {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 3.0,
+            ymax: 9.0,
+        },
+        features: vec![
+            feature(room, Style::Space { kind: "room".into() }, None, false),
+            feature(outline, Style::Linework, None, false),
+        ],
+    };
+    let png = render(&plan, 1600).expect("renders").png;
+    let pixmap = Pixmap::decode_png(&png).expect("a PNG");
+    let scale = 1470.0 / 9.0;
+    assert_eq!(pixmap.height(), 1600);
+    assert_eq!(pixmap.width(), (3.0 * scale + 80.0_f64).round() as u32);
+    let (x, y) = ((40.0 + 2.5 * scale).round() as u32, (40.0 + 8.8 * scale).round() as u32);
+    assert_ne!(pixel(&png, x, y), (255, 255, 255), "the bottom of the room is drawn");
+}

@@ -9,7 +9,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use sqlx::Row;
+use sqlx::{Row, postgres::PgRow};
 
 use super::House;
 use crate::{
@@ -176,11 +176,7 @@ impl House {
             .map(|r| Feature {
                 wkb: r.get("wkb"),
                 style: Style::Space { kind: r.get("kind") },
-                label: p.layers.labels.then(|| Label {
-                    text: r.get("name"),
-                    x: r.get("lx"),
-                    y: r.get("ly"),
-                }),
+                label: label(r, p.layers.labels),
                 highlight: highlight.contains(&Highlight::Space(r.get("id"))),
             })
             .collect())
@@ -207,11 +203,7 @@ impl House {
             .map(|r| Feature {
                 wkb: r.get("wkb"),
                 style: Style::Object { kind: r.get("kind") },
-                label: p.layers.labels.then(|| Label {
-                    text: r.get("name"),
-                    x: r.get("lx"),
-                    y: r.get("ly"),
-                }),
+                label: label(r, p.layers.labels),
                 highlight: highlight.contains(&Highlight::Object(r.get("id"))),
             })
             .collect())
@@ -229,4 +221,15 @@ impl House {
         .map_err(error::db)?;
         Ok(Extent { xmin, ymin, xmax, ymax })
     }
+}
+
+/// A row's name at its label point. An empty geometry, which QGIS can store,
+/// has no label point, so it is drawn without one.
+fn label(row: &PgRow, wanted: bool) -> Option<Label> {
+    let (x, y) = (row.get::<Option<f64>, _>("lx")?, row.get::<Option<f64>, _>("ly")?);
+    wanted.then(|| Label {
+        text: row.get("name"),
+        x,
+        y,
+    })
 }

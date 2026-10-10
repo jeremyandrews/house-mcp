@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
@@ -17,11 +17,13 @@ use rmcp::{ErrorData, model::ErrorCode};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
+use tokio_util::io::ReaderStream;
 
 use crate::{
     auth::{self, Caller, Tokens},
-    files::{FileStore, Sha256Hex},
-    mcp::{Links, NewFile, store_file},
+    files::FileStore,
+    markup::escape,
+    mcp::{Links, NewFile, live_file, store_file},
 };
 
 /// Uploads over HTTP may be larger than over MCP, but not unbounded.
@@ -39,11 +41,11 @@ pub struct Web {
 pub fn routes(web: Web, tokens: Arc<Tokens>) -> Router {
     let api = Router::new()
         .route("/api/files", axum::routing::post(api_upload))
-        .route("/api/files/{sha256}", get(api_download))
+        .route("/api/files/{sha256}", get(download))
         .layer(middleware::from_fn_with_state(tokens.clone(), auth::bearer));
     let page = Router::new()
         .route("/", get(page).post(page_upload))
-        .route("/files/{sha256}", get(page_download))
+        .route("/files/{sha256}", get(download))
         .layer(middleware::from_fn_with_state(tokens, auth::basic_read_write));
     Router::new()
         .route("/healthz", get(healthz))
@@ -105,47 +107,31 @@ async fn api_upload(
     }
 }
 
-async fn api_download(State(web): State<Web>, Path(sha256): Path<String>) -> Response {
-    download(&web, &sha256).await
-}
-
-async fn page_download(State(web): State<Web>, Path(sha256): Path<String>) -> Response {
-    download(&web, &sha256).await
-}
-
 /// Always an attachment of an opaque type, so a stored HTML or SVG file is
-/// never rendered by the browser in this origin.
-async fn download(web: &Web, sha256: &str) -> Response {
-    let Some(sha) = Sha256Hex::parse(sha256) else {
-        return (StatusCode::BAD_REQUEST, "not a lowercase hex sha256").into_response();
+/// never rendered by the browser in this origin. The file is streamed, so a
+/// few large downloads at once cannot exhaust the pod's memory.
+async fn download(State(web): State<Web>, Path(sha256): Path<String>) -> Response {
+    let file = match live_file(&web.db, "sha256", &sha256).await {
+        Ok(file) => file,
+        Err(e) => return error_response(e),
     };
-    let name: Option<String> =
-        match sqlx::query_scalar("SELECT name FROM file WHERE sha256 = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1")
-            .bind(sha.as_str())
-            .fetch_optional(&web.db)
-            .await
-        {
-            Ok(name) => name,
-            Err(e) => return error_response(crate::error::db(e)),
-        };
-    let Some(name) = name else {
-        return (StatusCode::NOT_FOUND, "no live file with this hash").into_response();
+    let (content, length) = match web.files.open_read(&file.sha).await {
+        Ok(opened) => opened,
+        Err(e) => return error_response(crate::error::internal("reading a file", e)),
     };
-    match web.files.get(&sha).await {
-        Ok(bytes) => (
-            [
-                (
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/octet-stream"),
-                ),
-                (header::CONTENT_DISPOSITION, content_disposition(&name)),
-                (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => error_response(crate::error::internal("reading a file", e)),
-    }
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            ),
+            (header::CONTENT_DISPOSITION, content_disposition(&file.name)),
+            (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+            (header::CONTENT_LENGTH, HeaderValue::from(length)),
+        ],
+        Body::from_stream(ReaderStream::new(content)),
+    )
+        .into_response()
 }
 
 async fn page(State(web): State<Web>) -> Response {
@@ -164,8 +150,8 @@ async fn page(State(web): State<Web>) -> Response {
         let created: chrono::DateTime<chrono::Utc> = row.get("created_at");
         table.push_str(&format!(
             "<tr><td><a href=\"/files/{sha}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape_html(&row.get::<String, _>("name")),
-            escape_html(&row.get::<String, _>("media_type")),
+            escape(&row.get::<String, _>("name")),
+            escape(&row.get::<String, _>("media_type")),
             row.get::<i64, _>("size"),
             created.format("%Y-%m-%d %H:%M"),
         ));
@@ -271,21 +257,6 @@ fn error_response(error: ErrorData) -> Response {
     (status, error.message.into_owned()).into_response()
 }
 
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// RFC 6266: an ASCII fallback name, and the real name percent encoded.
 fn content_disposition(name: &str) -> HeaderValue {
     let fallback: String = name
@@ -315,14 +286,6 @@ fn content_disposition(name: &str) -> HeaderValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn file_names_are_escaped_in_the_page() {
-        assert_eq!(
-            escape_html(r#"<img src=x onerror="a">'"#),
-            "&lt;img src=x onerror=&quot;a&quot;&gt;&#39;"
-        );
-    }
 
     #[test]
     fn download_names_cannot_break_the_header() {

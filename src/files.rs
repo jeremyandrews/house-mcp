@@ -81,6 +81,13 @@ impl FileStore {
         Ok(sha)
     }
 
+    /// The file opened for streaming, with its length.
+    pub async fn open_read(&self, sha: &Sha256Hex) -> std::io::Result<(fs::File, u64)> {
+        let file = fs::File::open(self.path(sha)).await?;
+        let length = file.metadata().await?.len();
+        Ok((file, length))
+    }
+
     pub async fn get(&self, sha: &Sha256Hex) -> std::io::Result<Vec<u8>> {
         fs::read(self.path(sha)).await
     }

@@ -543,29 +543,33 @@ async fn awkward_input_is_refused_or_survived() {
     .expect_err("refused");
     assert!(refused.contains("geometry: is empty"), "{refused}");
 
-    // QGIS can still store one; reading and drawing must survive it.
+    // QGIS cannot store one either, nor a curve, which no tool could read
+    // back as GeoJSON.
     let mut qgis = PgConnection::connect_with(&server.db.options("house_qgis", QGIS_PASSWORD))
         .await
         .expect("qgis");
-    sqlx::query(
-        "INSERT INTO object (site_id, floor_id, kind, name, geom) VALUES ($1, $2, 'light', 'Ghost', 'MULTIPOINT EMPTY'),
-                                                                        ($1, $2, 'light', 'Real', ST_MakePoint(1, 1))",
+    for geometry in ["MULTIPOINT EMPTY", "POINT EMPTY", "CIRCULARSTRING(0 0, 1 1, 2 0)"] {
+        let error = sqlx::query(
+            "INSERT INTO object (site_id, floor_id, kind, name, geom) VALUES ($1, $2, 'light', 'Ghost', $3::geometry)",
+        )
+        .bind(site)
+        .bind(floor)
+        .bind(geometry)
+        .execute(&mut qgis)
+        .await
+        .expect_err(geometry);
+        let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+        assert_eq!(code.as_deref(), Some("23514"), "{geometry}: {error}");
+    }
+    let error = sqlx::query(
+        "INSERT INTO space (site_id, floor_id, kind, name, geom) VALUES ($1, $2, 'room', 'Ghost', 'POLYGON EMPTY')",
     )
     .bind(site)
     .bind(floor)
     .execute(&mut qgis)
     .await
-    .expect("insert");
-    let nearest = ok(
-        &rw,
-        "nearest",
-        json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
-    )
-    .await;
-    assert_eq!(nearest[0]["name"], "Real");
-    call(&rw, "render_plan", json!({"site_id": site, "floor_id": floor}))
-        .await
-        .expect("renders past an empty geometry");
+    .expect_err("empty space");
+    assert!(error.to_string().contains("space_geom_check"), "{error}");
 
     // Soft deleted, then removed outright from QGIS: restore brings it back live.
     let note = ok(
@@ -611,4 +615,153 @@ async fn awkward_input_is_refused_or_survived() {
     )
     .await;
     assert_eq!(import["spaces"][0]["name"], "x".repeat(200));
+}
+
+#[tokio::test]
+async fn limits_and_refusals_name_their_field() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let http = reqwest::Client::new();
+    let site = ok(
+        &rw,
+        "create_site",
+        json!({"name": "Limits", "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("site id");
+    let floor = ok(
+        &rw,
+        "upsert_floor",
+        json!({"site_id": site, "name": "Ground", "level": 0, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("floor id");
+
+    // Uploads over the tool limit name the field that carried them.
+    let tool_limit = 25 * 1024 * 1024;
+    let refused = call(
+        &rw,
+        "upload_file",
+        json!({"name": "big.txt", "text": "x".repeat(tool_limit + 1), "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("text: is larger than 25 MiB"), "{refused}");
+    let refused = call(
+        &rw,
+        "upload_file",
+        json!({"name": "big.bin", "base64": STANDARD.encode(vec![0u8; tool_limit + 1]), "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("base64: decodes to more than 25 MiB"), "{refused}");
+
+    // A file larger than an import reads is refused before it is parsed.
+    let big = http
+        .post(format!("{}/api/files?name=huge.dxf&reason=test", server.base))
+        .bearer_auth(RW)
+        .body(vec![b' '; 16 * 1024 * 1024 + 1])
+        .send()
+        .await
+        .expect("upload");
+    let big: Value = big.json().await.expect("json");
+    let refused = call(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": big["sha256"], "floor_id": floor, "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("file_sha256: is larger than 16 MiB"), "{refused}");
+    let refused = call(
+        &rw,
+        "import_geojson",
+        json!({"site_id": site, "file_sha256": big["sha256"], "as": "space", "kind": "parcel", "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("file_sha256: is larger than 16 MiB"), "{refused}");
+
+    // A deleted file is gone from every route that reads files.
+    let file = ok(
+        &rw,
+        "upload_file",
+        json!({"name": "gone.dxf", "base64": STANDARD.encode(two_room_dxf()), "reason": "test"}),
+    )
+    .await;
+    let sha = file["sha256"].as_str().expect("sha256").to_owned();
+    ok(
+        &rw,
+        "delete",
+        json!({"kind": "file", "id": file["id"], "reason": "test"}),
+    )
+    .await;
+    let download = http
+        .get(format!("{}/api/files/{sha}", server.base))
+        .bearer_auth(RW)
+        .send()
+        .await
+        .expect("download");
+    assert_eq!(download.status(), 404);
+    let refused = call(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": sha, "floor_id": floor, "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("no live file with this hash"), "{refused}");
+
+    // Postgres refuses a NUL in text; the caller hears why.
+    let refused = call(&rw, "add_note", json!({"body": "fine", "reason": "a\0b"}))
+        .await
+        .expect_err("refused");
+    assert!(refused.contains("reason: contains a NUL character"), "{refused}");
+    let refused = call(&rw, "add_note", json!({"body": "a\0b", "reason": "test"}))
+        .await
+        .expect_err("refused");
+    assert!(refused.contains("input: contains a NUL character"), "{refused}");
+
+    // Empty geometry in a GeoJSON import is refused by feature.
+    for target in ["space", "object"] {
+        let empty = json!({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": []}});
+        let refused = call(
+            &rw,
+            "import_geojson",
+            json!({"site_id": site, "geojson": empty, "as": target, "kind": "parcel", "reason": "test"}),
+        )
+        .await
+        .expect_err("refused");
+        assert!(refused.contains("features[0]: is empty"), "{target}: {refused}");
+    }
+
+    // A room's name is its tallest text that is not blank, trimmed.
+    let mut drawing = common::drawing(dxf::enums::Units::Meters);
+    drawing.add_entity(common::on_layer("A-ROOM", common::rectangle(0.0, 0.0, 4.0, 3.0)));
+    for (value, height, x) in [("  Pantry  ", 0.2, 1.0), ("   ", 0.5, 2.0)] {
+        drawing.add_entity(common::on_layer(
+            "A-TEXT",
+            dxf::entities::EntityType::Text(dxf::entities::Text {
+                location: dxf::Point::new(x, 1.0, 0.0),
+                text_height: height,
+                value: value.into(),
+                ..Default::default()
+            }),
+        ));
+    }
+    let file = ok(
+        &rw,
+        "upload_file",
+        json!({"name": "pantry.dxf", "base64": STANDARD.encode(common::save(&drawing)), "reason": "test"}),
+    )
+    .await;
+    let import = ok(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "floor_id": floor, "layers": {"A-ROOM": {"space": "room"}}, "reason": "test"}),
+    )
+    .await;
+    assert_eq!(import["spaces"][0]["name"], "Pantry");
 }

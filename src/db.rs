@@ -11,7 +11,7 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The name the change triggers record as the client for the server's own
 /// writes.
-pub const APPLICATION_NAME: &str = "house-mcp";
+const APPLICATION_NAME: &str = "house-mcp";
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     let options = PgConnectOptions::from_str(url)?

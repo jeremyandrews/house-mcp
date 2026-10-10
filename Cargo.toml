@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
-chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock"] }
+chrono = { version = "0.4.45", default-features = false, features = ["serde"] }
 dxf = "0.6.2"
 geozero = { version = "0.15.1", default-features = false, features = ["with-wkb", "with-geojson"] }
 hex = "0.4.3"

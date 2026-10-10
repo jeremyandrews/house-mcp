@@ -412,13 +412,17 @@ fn arc_with_a_downward_normal_is_mirrored() {
     let mut tilted = Arc::new(Point::origin(), 1.0, 0.0, 90.0);
     tilted.normal = dxf::Vector::new(1.0, 0.0, 0.0);
     drawing.add_entity(on_layer("A-WALL", EntityType::Arc(tilted)));
+    // Tilted but still facing up: not a plan entity either.
+    let mut leaning = Arc::new(Point::origin(), 1.0, 0.0, 90.0);
+    leaning.normal = dxf::Vector::new(0.6, 0.0, 0.8);
+    drawing.add_entity(on_layer("A-WALL", EntityType::Arc(leaning)));
     let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
     assert_eq!(parsed.linework.len(), 1);
     let arc = coordinates(&parsed.linework[0].geometry);
     assert!(near(arc[0], (-3.0, 0.0)), "{arc:?}");
     assert!(near(arc[arc.len() - 1], (-2.0, 1.0)), "{arc:?}");
-    let reasons: Vec<_> = parsed.skipped.keys().map(|s| s.reason.as_str()).collect();
-    assert_eq!(reasons, ["extrusion is not along the z axis"]);
+    let skips: Vec<_> = parsed.skipped.iter().map(|(s, n)| (s.reason.as_str(), *n)).collect();
+    assert_eq!(skips, [("extrusion is not along the z axis", 2)]);
 }
 
 #[test]
@@ -432,8 +436,12 @@ fn arc_with_absurd_angles_is_drawn_in_one_turn() {
     ));
     let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
     let arc = coordinates(&parsed.linework[0].geometry);
-    assert!(arc.len() <= 73, "{}", arc.len());
+    // 0 to 280 degrees in 5 degree steps.
+    assert_eq!(arc.len(), 57);
     assert!(near(arc[0], (1.0, 0.0)), "{arc:?}");
+    assert!(arc.iter().any(|&p| near(p, (0.0, 1.0))), "{arc:?}");
+    let end = 280_f64.to_radians();
+    assert!(near(arc[56], (end.cos(), end.sin())), "{arc:?}");
 }
 
 #[test]
@@ -462,4 +470,117 @@ fn repeated_long_polylines_stop_at_the_vertex_limit() {
         .err()
         .expect("refused");
     assert!(matches!(error, ImportError::TooManyVertices), "{error}");
+}
+
+#[test]
+fn mirrored_arc_in_a_rotated_block_is_mirrored_before_it_is_placed() {
+    // In the block, the -Z arc round (2, 0) is the arc round (-2, 0) from
+    // (-3, 0) to (-2, 1). The insertion turns that 90 degrees and moves it to
+    // (10, 5), so it runs from (10, 2) to (9, 3).
+    let mut drawing = drawing(Units::Meters);
+    let mut arc = Arc::new(Point::new(2.0, 0.0, 0.0), 1.0, 0.0, 90.0);
+    arc.normal = dxf::Vector::new(0.0, 0.0, -1.0);
+    let mut block = Block {
+        name: "MIRRORED".into(),
+        ..Default::default()
+    };
+    block.entities.push(Entity::new(EntityType::Arc(arc)));
+    drawing.add_block(block);
+    drawing.add_entity(Entity::new(EntityType::Insert(Insert {
+        name: "MIRRORED".into(),
+        location: Point::new(10.0, 5.0, 0.0),
+        rotation: 90.0,
+        ..Default::default()
+    })));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    let arc = coordinates(&parsed.linework[0].geometry);
+    assert!(near(arc[0], (10.0, 2.0)), "{arc:?}");
+    assert!(near(arc[arc.len() - 1], (9.0, 3.0)), "{arc:?}");
+}
+
+#[test]
+fn downward_polylines_and_circles_are_mirrored() {
+    let mut drawing = drawing(Units::Meters);
+    let down = dxf::Vector::new(0.0, 0.0, -1.0);
+    let corners = [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)];
+    let mut light = LwPolyline::default();
+    for (x, y) in corners {
+        light.vertices.push(dxf::LwPolylineVertex {
+            x,
+            y,
+            ..Default::default()
+        });
+    }
+    light.set_is_closed(true);
+    light.extrusion_direction = down.clone();
+    drawing.add_entity(on_layer("A-ROOM", EntityType::LwPolyline(light)));
+    let mut old = Polyline::default();
+    for (x, y) in corners {
+        old.add_vertex(&mut drawing, Vertex::new(Point::new(x, y, 0.0)));
+    }
+    old.set_is_closed(true);
+    old.normal = down.clone();
+    drawing.add_entity(on_layer("A-ROOM", EntityType::Polyline(old)));
+    let mut circle = Circle::new(Point::new(2.0, 0.0, 0.0), 1.0);
+    circle.normal = down;
+    drawing.add_entity(on_layer("A-WALL", EntityType::Circle(circle)));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    assert_eq!(parsed.spaces.len(), 2);
+    for space in &parsed.spaces {
+        let ring = coordinates(&json!({"coordinates": space.polygon["coordinates"][0]}));
+        assert!(
+            ring.iter().all(|&(x, _)| (-2.0 - 1e-9..=-1.0 + 1e-9).contains(&x)),
+            "{ring:?}"
+        );
+    }
+    let circle = coordinates(
+        &parsed
+            .linework
+            .iter()
+            .find(|l| l.entity == "CIRCLE")
+            .expect("circle")
+            .geometry,
+    );
+    assert!(near(circle[0], (-3.0, 0.0)), "{circle:?}");
+    assert!(circle.iter().all(|&(x, y)| ((x + 2.0).hypot(y) - 1.0).abs() < 1e-9));
+}
+
+#[test]
+fn downward_text_and_insert_are_mirrored_and_tilted_ones_skipped() {
+    let mut drawing = drawing(Units::Meters);
+    let down = dxf::Vector::new(0.0, 0.0, -1.0);
+    let mut label = dxf::entities::Text {
+        location: Point::new(5.0, 1.0, 0.0),
+        text_height: 0.2,
+        value: "Hall".into(),
+        ..Default::default()
+    };
+    label.normal = down.clone();
+    drawing.add_entity(on_layer("A-TEXT", EntityType::Text(label)));
+    drawing.add_block(Block {
+        name: "LIGHT".into(),
+        ..Default::default()
+    });
+    for (x, normal) in [(5.0, down), (7.0, dxf::Vector::new(0.6, 0.0, 0.8))] {
+        drawing.add_entity(on_layer(
+            "E-LIGHT",
+            EntityType::Insert(Insert {
+                name: "LIGHT".into(),
+                location: Point::new(x, 2.0, 0.0),
+                extrusion_direction: normal,
+                ..Default::default()
+            }),
+        ));
+    }
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    let text = parsed.linework.iter().find(|l| l.entity == "TEXT").expect("text");
+    assert_eq!(text.geometry["coordinates"], json!([-5.0, 1.0]));
+    assert_eq!(parsed.objects.len(), 1);
+    assert_eq!(parsed.objects[0].point["coordinates"], json!([-5.0, 2.0]));
+    let skips: Vec<_> = parsed
+        .skipped
+        .iter()
+        .map(|(s, n)| (s.entity.as_str(), s.reason.as_str(), *n))
+        .collect();
+    assert_eq!(skips, [("INSERT", "extrusion is not along the z axis", 1)]);
 }

@@ -69,7 +69,7 @@ CREATE TABLE space (
     floor_id        bigint,
     name            text NOT NULL CHECK (name <> '' AND length(name) <= 200),
     kind            text NOT NULL CHECK (kind IN ('room', 'terrace', 'garden_bed', 'pool', 'parcel', 'building')),
-    geom            geometry(Polygon, 0) NOT NULL,
+    geom            geometry(Polygon, 0) NOT NULL CHECK (NOT ST_IsEmpty(geom)),
     wall_material   text,
     attributes      jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(attributes) = 'object'),
     dxf_import_id   bigint REFERENCES dxf_import (id),
@@ -89,7 +89,10 @@ CREATE TABLE object (
     -- pipe, cable_run, or any other lowercase word.
     kind            text NOT NULL CHECK (kind ~ '^[a-z][a-z0-9_]{0,39}$'),
     name            text NOT NULL CHECK (name <> '' AND length(name) <= 200),
-    geom            geometry(Geometry, 0) NOT NULL,
+    geom            geometry(Geometry, 0) NOT NULL CHECK (
+                        GeometryType(geom) IN ('POINT', 'LINESTRING', 'POLYGON', 'MULTIPOINT', 'MULTILINESTRING', 'MULTIPOLYGON')
+                        AND NOT ST_IsEmpty(geom)
+                    ),
     -- Metres above the floor, or above the ground outdoors.
     height          double precision,
     -- Identifiers in other systems: ha_entity_id, unifi_mac and the like.
@@ -116,7 +119,7 @@ CREATE TABLE linework (
     floor_id        bigint NOT NULL REFERENCES floor (id),
     layer           text NOT NULL,
     entity          text NOT NULL,
-    geom            geometry(Geometry, 0) NOT NULL,
+    geom            geometry(Geometry, 0) NOT NULL CHECK (NOT ST_IsEmpty(geom)),
     text            text,
     text_height     double precision,
     deleted_at      timestamptz

@@ -14,18 +14,17 @@ use sqlx::{PgConnection, Row};
 
 use super::{
     House, json_result, reason,
-    write::{check_epsg, check_space_kind, object_kind},
+    write::{OBJECT_GEOMETRY_TYPES, check_epsg, check_geometry, check_space_kind, object_kind},
     writer,
 };
 use crate::{
     db,
     dxf_import::{self, LayerTarget, Parsed, Transform},
     error,
-    geom::MAX_VERTICES,
     units::LengthUnit,
 };
 
-pub const MAX_FEATURES: usize = 10_000;
+const MAX_FEATURES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -137,7 +136,7 @@ impl House {
         if !(p.transform.scale.is_finite() && p.transform.scale > 0.0) {
             return Err(error::invalid("transform.scale", "must be positive"));
         }
-        let (file, bytes) = self.live_file_bytes("file_sha256", &p.file_sha256).await?;
+        let (file, bytes) = self.import_bytes("file_sha256", &p.file_sha256).await?;
         if is_dwg(&file.name, &bytes) {
             return Err(error::invalid(
                 "file_sha256",
@@ -199,7 +198,7 @@ impl House {
 
 impl House {
     async fn stored_json(&self, sha: &str) -> Result<Value, ErrorData> {
-        let (_, bytes) = self.live_file_bytes("file_sha256", sha).await?;
+        let (_, bytes) = self.import_bytes("file_sha256", sha).await?;
         serde_json::from_slice(&bytes).map_err(|e| error::invalid("file_sha256", format!("not JSON: {e}")))
     }
 }
@@ -270,55 +269,41 @@ async fn insert_feature(
     epsg: i32,
     row: &FeatureRow,
 ) -> Result<Vec<i64>, ErrorData> {
-    let (points, empty, valid): (i32, bool, bool) = sqlx::query_as(
-        "SELECT ST_NPoints(g), ST_IsEmpty(g), ST_IsValid(g) FROM house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3) AS g",
-    )
-    .bind(&row.wkb)
-    .bind(epsg)
-    .bind(p.site_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(error::db)?;
-    if empty {
-        return Err(error::invalid(&row.field, "has an empty geometry"));
-    }
-    if usize::try_from(points).unwrap_or(usize::MAX) > MAX_VERTICES {
-        return Err(error::invalid(
-            &row.field,
-            format!("has more than {MAX_VERTICES} vertices"),
-        ));
-    }
-    if !valid {
-        return Err(error::invalid(&row.field, "has an invalid geometry"));
-    }
+    let local: Vec<u8> =
+        sqlx::query_scalar("SELECT ST_AsBinary(house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3))")
+            .bind(&row.wkb)
+            .bind(epsg)
+            .bind(p.site_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(error::db)?;
+    let allowed = match p.target {
+        FeatureTarget::Space => &["POLYGON", "MULTIPOLYGON"][..],
+        FeatureTarget::Object => OBJECT_GEOMETRY_TYPES,
+    };
+    check_geometry(tx, &row.field, &local, allowed).await?;
     let sql = match p.target {
         FeatureTarget::Space => {
             "INSERT INTO space (site_id, floor_id, name, kind, geom)
-             SELECT $3, $4, CASE WHEN count(*) OVER () > 1 THEN $5 || ' (' || d.path[1] || ')' ELSE $5 END, $6, d.geom
-             FROM ST_Dump(house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3)) AS d
-             WHERE GeometryType(d.geom) = 'POLYGON'
+             SELECT $2, $3, CASE WHEN count(*) OVER () > 1 THEN $4 || ' (' || d.path[1] || ')' ELSE $4 END, $5, d.geom
+             FROM ST_Dump(ST_GeomFromWKB($1, 0)) AS d
              RETURNING id"
         }
         FeatureTarget::Object => {
             "INSERT INTO object (site_id, floor_id, name, kind, geom)
-             VALUES ($3, $4, $5, $6, house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3))
+             VALUES ($2, $3, $4, $5, ST_GeomFromWKB($1, 0))
              RETURNING id"
         }
     };
-    let ids: Vec<i64> = sqlx::query_scalar(sql)
-        .bind(&row.wkb)
-        .bind(epsg)
+    sqlx::query_scalar(sql)
+        .bind(&local)
         .bind(p.site_id)
         .bind(p.floor_id)
         .bind(&row.name)
         .bind(&row.kind)
         .fetch_all(&mut *tx)
         .await
-        .map_err(error::db)?;
-    if ids.is_empty() {
-        return Err(error::invalid(&row.field, "has no polygon to make a space from"));
-    }
-    Ok(ids)
+        .map_err(error::db)
 }
 
 /// Marks an earlier import of the same content onto the same floor as

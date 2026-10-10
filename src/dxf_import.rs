@@ -18,11 +18,11 @@ use crate::{geom::MAX_VERTICES, units::LengthUnit};
 
 /// Entities read, counting every copy an INSERT expands to. Bounds the work a
 /// drawing of deeply repeated blocks can cause.
-pub const MAX_ENTITIES: usize = 100_000;
+const MAX_ENTITIES: usize = 100_000;
 /// Vertices across the whole drawing. A block of long polylines inserted many
 /// times stays under the entity limit while multiplying its points, so the
 /// points are counted too.
-pub const MAX_TOTAL_VERTICES: usize = 2_000_000;
+const MAX_TOTAL_VERTICES: usize = 2_000_000;
 pub const MAX_BLOCK_DEPTH: usize = 16;
 /// Arcs and circles are stored as line strings with a segment per this many
 /// degrees.
@@ -205,9 +205,9 @@ struct Reader<'a> {
 
 /// What an entity contributes to the linework, before it is counted and
 /// checked.
-enum Shape {
+enum Shape<'p> {
     Point((f64, f64)),
-    Line(Vec<(f64, f64)>),
+    Line(&'p [(f64, f64)]),
 }
 
 impl<'a> Reader<'a> {
@@ -232,12 +232,12 @@ impl<'a> Reader<'a> {
         &mut self,
         layer: &str,
         entity: &'static str,
-        shape: &Shape,
+        shape: &Shape<'_>,
         text: Option<(String, f64)>,
     ) -> Result<bool, ImportError> {
         let points = match shape {
             Shape::Point(point) => std::slice::from_ref(point),
-            Shape::Line(points) => points.as_slice(),
+            Shape::Line(points) => points,
         };
         self.vertices += points.len();
         if self.vertices > MAX_TOTAL_VERTICES {
@@ -281,7 +281,7 @@ impl<'a> Reader<'a> {
         match &entity.specific {
             EntityType::Line(line) => {
                 let points = vec![at.apply(line.p1.x, line.p1.y), at.apply(line.p2.x, line.p2.y)];
-                self.push_linework(&layer, name, &Shape::Line(points), None)?;
+                self.push_linework(&layer, name, &Shape::Line(&points), None)?;
             }
             EntityType::LwPolyline(poly) => {
                 let Some(at) = self.in_ocs(&layer, name, &poly.extrusion_direction, at) else {
@@ -322,7 +322,7 @@ impl<'a> Reader<'a> {
                     end += 360.0;
                 }
                 let points = arc_points(arc.center.x, arc.center.y, arc.radius, start, end);
-                self.push_linework(&layer, name, &Shape::Line(at.apply_all(&points)), None)?;
+                self.push_linework(&layer, name, &Shape::Line(&at.apply_all(&points)), None)?;
             }
             EntityType::Circle(circle) => {
                 if !circle.radius.is_finite() {
@@ -333,13 +333,20 @@ impl<'a> Reader<'a> {
                     return Ok(());
                 };
                 let points = arc_points(circle.center.x, circle.center.y, circle.radius, 0.0, 360.0);
-                self.push_linework(&layer, name, &Shape::Line(at.apply_all(&points)), None)?;
+                self.push_linework(&layer, name, &Shape::Line(&at.apply_all(&points)), None)?;
             }
             EntityType::Text(text) => {
+                let Some(at) = self.in_ocs(&layer, name, &text.normal, at) else {
+                    return Ok(());
+                };
                 let point = at.apply(text.location.x, text.location.y);
                 let height = text.text_height * at.scale();
-                self.push_linework(&layer, name, &Shape::Point(point), Some((text.value.clone(), height)))?;
+                // Postgres text cannot hold a NUL.
+                let value = text.value.replace('\0', "");
+                self.push_linework(&layer, name, &Shape::Point(point), Some((value, height)))?;
             }
+            // An MTEXT insertion point is in the drawing's own coordinates, not
+            // the entity's, so it needs no mirroring.
             EntityType::MText(text) => {
                 let point = at.apply(text.insertion_point.x, text.insertion_point.y);
                 let mut raw = text.extended_text.concat();
@@ -381,6 +388,9 @@ impl<'a> Reader<'a> {
         if self.stack.len() >= MAX_BLOCK_DEPTH {
             return Err(ImportError::TooDeep(name.to_owned()));
         }
+        let Some(at) = self.in_ocs(layer, "INSERT", &insert.extrusion_direction, at) else {
+            return Ok(());
+        };
         let placed = at.then(&Affine::insert(insert, &block.base_point));
         if let Some(LayerTarget::Object(kind)) = self.target(layer) {
             let (x, y) = at.apply(insert.location.x, insert.location.y);
@@ -421,13 +431,10 @@ impl<'a> Reader<'a> {
             self.skip(layer, entity, "more vertices than the limit");
             return Ok(());
         }
-        let shape = Shape::Line(at.apply_all(&points));
-        if !self.push_linework(layer, entity, &shape, None)? {
+        let points = at.apply_all(&points);
+        if !self.push_linework(layer, entity, &Shape::Line(&points), None)? {
             return Ok(());
         }
-        let Shape::Line(points) = shape else {
-            return Ok(());
-        };
         if let Some(LayerTarget::Space(kind)) = self.target(layer) {
             if closed && points.len() >= 4 {
                 self.out.layers.entry(layer.to_owned()).or_default().spaces += 1;
@@ -590,7 +597,12 @@ fn plain_mtext(raw: &str) -> String {
                 Some(escaped @ ('\\' | '{' | '}')) => out.push(escaped),
                 Some('U') => {
                     let code: String = chars.by_ref().skip(1).take(4).collect();
-                    out.extend(u32::from_str_radix(&code, 16).ok().and_then(char::from_u32));
+                    out.extend(
+                        u32::from_str_radix(&code, 16)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .filter(|&c| c != '\0'),
+                    );
                 }
                 Some('L' | 'l' | 'O' | 'o' | 'K' | 'k') | None => {}
                 // Every other code carries a value that ends at a semicolon.
@@ -603,6 +615,8 @@ fn plain_mtext(raw: &str) -> String {
                 }
             },
             '{' | '}' => {}
+            // Postgres text cannot hold a NUL, raw or decoded from \U+0000.
+            '\0' => {}
             other => out.push(other),
         }
     }
@@ -728,6 +742,11 @@ mod tests {
             scale: 2.0,
         };
         assert!(close(Affine::user(1.0, &t).apply(3.0, 0.0), (100.0, 56.0)));
+    }
+
+    #[test]
+    fn nul_characters_are_dropped_from_mtext() {
+        assert_eq!(plain_mtext("a\\U+0000b\0c"), "abc");
     }
 
     #[test]

@@ -84,6 +84,7 @@ Importing the same file content onto the same floor again marks the earlier impo
 | MCP request body | 36 MiB |
 | file through a tool call | 25 MiB |
 | file through HTTP | 100 MiB |
+| stored file an import reads (DXF or GeoJSON) | 16 MiB |
 | DXF entities, counting every copy a block expands to | 100,000 |
 | DXF vertices, counted the same way | 2,000,000 |
 | DXF block nesting | 16 levels; a block that inserts itself is refused |

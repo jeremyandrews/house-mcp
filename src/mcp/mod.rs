@@ -168,25 +168,36 @@ pub struct LiveFile {
     pub sha: Sha256Hex,
     pub id: i64,
     pub name: String,
+    pub size: i64,
 }
 
 /// Finds the live record for a caller's sha256, refused naming `field` when
 /// the hash is malformed or no live record has it.
 pub async fn live_file(pool: &PgPool, field: &str, sha: &str) -> Result<LiveFile, ErrorData> {
     let sha = Sha256Hex::parse(sha).ok_or_else(|| error::invalid(field, "not a lowercase hex sha256"))?;
-    let (id, name): (i64, String) =
-        sqlx::query_as("SELECT id, name FROM file WHERE sha256 = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1")
+    let (id, name, size): (i64, String, i64) =
+        sqlx::query_as("SELECT id, name, size FROM file WHERE sha256 = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1")
             .bind(sha.as_str())
             .fetch_optional(pool)
             .await
             .map_err(error::db)?
             .ok_or_else(|| error::invalid(field, "no live file with this hash"))?;
-    Ok(LiveFile { sha, id, name })
+    Ok(LiveFile { sha, id, name, size })
 }
 
+/// The largest stored file an import reads. Parsing builds the whole drawing
+/// or document in memory at many times its size on disk, before any entity or
+/// feature limit can apply.
+pub const MAX_IMPORT_FILE: i64 = 16 * 1024 * 1024;
+
 impl House {
-    async fn live_file_bytes(&self, field: &str, sha: &str) -> Result<(LiveFile, Vec<u8>), ErrorData> {
+    /// A stored file's bytes for an import, refused before reading when it is
+    /// larger than an import may parse.
+    async fn import_bytes(&self, field: &str, sha: &str) -> Result<(LiveFile, Vec<u8>), ErrorData> {
         let file = live_file(&self.db, field, sha).await?;
+        if file.size > MAX_IMPORT_FILE {
+            return Err(error::invalid(field, "is larger than 16 MiB, the most an import reads"));
+        }
         let bytes = self
             .files
             .get(&file.sha)
@@ -223,6 +234,9 @@ fn reason(value: &str) -> Result<&str, ErrorData> {
     let value = value.trim();
     if value.is_empty() {
         return Err(error::invalid("reason", "is required"));
+    }
+    if value.contains('\0') {
+        return Err(error::invalid("reason", "contains a NUL character"));
     }
     if value.chars().count() > 1000 {
         return Err(error::invalid("reason", "is longer than 1000 characters"));

@@ -19,6 +19,15 @@ use crate::{db, error, files::FileStore, geom::MAX_VERTICES};
 /// The largest file a tool call may carry. Larger files go through
 /// `POST /api/files`.
 pub const MAX_TOOL_FILE: usize = 25 * 1024 * 1024;
+/// The geometry an object may have. The same list is a CHECK on `object.geom`.
+pub(super) const OBJECT_GEOMETRY_TYPES: &[&str] = &[
+    "POINT",
+    "LINESTRING",
+    "POLYGON",
+    "MULTIPOINT",
+    "MULTILINESTRING",
+    "MULTIPOLYGON",
+];
 const SPACE_KINDS: [&str; 6] = ["room", "terrace", "garden_bed", "pool", "parcel", "building"];
 
 /// The same statement for whichever table a [`Kind`] names. Every variant is
@@ -315,20 +324,7 @@ impl House {
         }
         let geometry = wkb("geometry", &p.geometry)?;
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
-        check_geometry(
-            &mut tx,
-            "geometry",
-            &geometry,
-            &[
-                "POINT",
-                "LINESTRING",
-                "POLYGON",
-                "MULTIPOINT",
-                "MULTILINESTRING",
-                "MULTIPOLYGON",
-            ],
-        )
-        .await?;
+        check_geometry(&mut tx, "geometry", &geometry, OBJECT_GEOMETRY_TYPES).await?;
         let refs = p.refs.map(|refs| json!(refs));
         let id: Option<i64> = sqlx::query_scalar(
             "WITH created AS (
@@ -456,7 +452,6 @@ impl House {
         Parameters(p): Parameters<UploadFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let author = &writer(&parts)?.name;
-        let reason = reason(&p.reason)?;
         let bytes = match (p.text, p.base64) {
             (Some(text), None) => {
                 if text.len() > MAX_TOOL_FILE {
@@ -482,7 +477,7 @@ impl House {
             &self.db,
             &self.files,
             author,
-            reason,
+            &p.reason,
             NewFile {
                 name: &p.name,
                 media_type: p.media_type.as_deref(),
@@ -601,6 +596,7 @@ pub async fn store_file(
     reason: &str,
     file: NewFile<'_>,
 ) -> Result<Value, ErrorData> {
+    let reason = super::reason(reason)?;
     let name = file.name.trim();
     if name.is_empty() || name.chars().count() > 255 || name.chars().any(char::is_control) {
         return Err(error::invalid(

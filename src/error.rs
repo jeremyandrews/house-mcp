@@ -23,6 +23,8 @@ pub fn db(error: sqlx::Error) -> ErrorData {
             Some("23503") => return invalid(&constraint, "refers to a row that does not exist"),
             Some("23505") => return invalid(&constraint, "a live row with this value already exists"),
             Some("23514") => return invalid(&constraint, "value is not allowed"),
+            // Postgres refuses a NUL in text (22021) and in jsonb (22P05).
+            Some("22021" | "22P05") => return invalid("input", "contains a NUL character"),
             // Raised by the frame functions with a message meant for the caller.
             Some("22023") => return invalid("site", e.message()),
             _ => {}

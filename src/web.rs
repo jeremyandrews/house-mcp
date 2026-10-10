@@ -21,7 +21,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     auth::{self, Caller, Tokens},
-    files::FileStore,
+    files::{FileStore, Sha256Hex},
     markup::escape,
     mcp::{Links, NewFile, live_file, store_file},
 };
@@ -111,8 +111,16 @@ async fn api_upload(
 /// never rendered by the browser in this origin. The file is streamed, so a
 /// few large downloads at once cannot exhaust the pod's memory.
 async fn download(State(web): State<Web>, Path(sha256): Path<String>) -> Response {
+    if Sha256Hex::parse(&sha256).is_none() {
+        return (StatusCode::BAD_REQUEST, "sha256: not a lowercase hex sha256").into_response();
+    }
+    // The hash is well formed, so the only way left to fail as the caller's
+    // fault is that no live file has it.
     let file = match live_file(&web.db, "sha256", &sha256).await {
         Ok(file) => file,
+        Err(e) if e.code == ErrorCode::INVALID_PARAMS => {
+            return (StatusCode::NOT_FOUND, "no live file with this hash").into_response();
+        }
         Err(e) => return error_response(e),
     };
     let (content, length) = match web.files.open_read(&file.sha).await {
@@ -208,16 +216,13 @@ async fn page_upload(
     let Some((name, media_type, bytes)) = file else {
         return (StatusCode::BAD_REQUEST, "file: is required").into_response();
     };
-    if reason.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "reason: is required").into_response();
-    }
     let new = NewFile {
         name: &name,
         media_type: media_type.as_deref().filter(|t| *t != "application/octet-stream"),
         bytes: &bytes,
         links: &Links::default(),
     };
-    match store_file(&web.db, &web.files, &caller.name, reason.trim(), new).await {
+    match store_file(&web.db, &web.files, &caller.name, &reason, new).await {
         Ok(_) => Redirect::to("/").into_response(),
         Err(e) => error_response(e),
     }
@@ -304,6 +309,10 @@ mod tests {
         assert!(!same_origin(&headers));
         headers.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
         assert!(!same_origin(&headers));
+        for other_scheme in ["ftp://house.pozza", "null"] {
+            headers.insert(header::ORIGIN, HeaderValue::from_static(other_scheme));
+            assert!(!same_origin(&headers), "{other_scheme}");
+        }
         headers.insert(header::ORIGIN, HeaderValue::from_static("https://house.pozza"));
         assert!(same_origin(&headers));
     }

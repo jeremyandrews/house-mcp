@@ -140,7 +140,7 @@ impl House {
 impl House {
     async fn linework_features(&self, floor_id: i64) -> Result<Vec<Feature>, ErrorData> {
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT ST_AsBinary(geom) FROM linework WHERE floor_id = $1 AND deleted_at IS NULL AND text IS NULL",
+            "SELECT ST_AsBinary(geom) FROM linework WHERE floor_id = $1 AND deleted_at IS NULL AND text IS NULL AND NOT ST_IsEmpty(geom)",
         )
         .bind(floor_id)
         .fetch_all(&self.db)
@@ -164,7 +164,7 @@ impl House {
     ) -> Result<Vec<Feature>, ErrorData> {
         let rows = sqlx::query(
             "SELECT id, name, kind, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
-             FROM space WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2",
+             FROM space WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2 AND NOT ST_IsEmpty(geom)",
         )
         .bind(p.site_id)
         .bind(p.floor_id)
@@ -189,7 +189,7 @@ impl House {
     ) -> Result<Vec<Feature>, ErrorData> {
         let rows = sqlx::query(
             "SELECT id, name, kind, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
-             FROM object WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2
+             FROM object WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2 AND NOT ST_IsEmpty(geom)
                AND ($3::text[] IS NULL OR kind = ANY($3))",
         )
         .bind(p.site_id)

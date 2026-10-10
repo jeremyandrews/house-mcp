@@ -19,6 +19,21 @@ pub enum LengthUnit {
 }
 
 impl LengthUnit {
+    /// The name a call uses for this unit, as stored with an import.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Millimetres => "millimetres",
+            Self::Centimetres => "centimetres",
+            Self::Decimetres => "decimetres",
+            Self::Metres => "metres",
+            Self::Kilometres => "kilometres",
+            Self::Inches => "inches",
+            Self::Feet => "feet",
+            Self::Yards => "yards",
+            Self::UsSurveyFeet => "us_survey_feet",
+        }
+    }
+
     pub fn metres(self) -> f64 {
         match self {
             Self::Millimetres => 0.001,
@@ -73,6 +88,24 @@ mod tests {
         for (header, metres) in cases {
             let unit = LengthUnit::from_insunits(header).expect("a length unit");
             assert!((unit.metres() - metres).abs() < 1e-9, "{header:?}");
+        }
+    }
+
+    #[test]
+    fn names_match_what_a_call_sends() {
+        let all = [
+            LengthUnit::Millimetres,
+            LengthUnit::Centimetres,
+            LengthUnit::Decimetres,
+            LengthUnit::Metres,
+            LengthUnit::Kilometres,
+            LengthUnit::Inches,
+            LengthUnit::Feet,
+            LengthUnit::Yards,
+            LengthUnit::UsSurveyFeet,
+        ];
+        for unit in all {
+            assert_eq!(serde_json::json!(unit), unit.name());
         }
     }
 

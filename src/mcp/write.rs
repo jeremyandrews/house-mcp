@@ -13,12 +13,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{PgConnection, PgPool};
 
-use super::{House, Kind, Links, json_result, reason, wkb, writer};
+use super::{House, Kind, Links, MIB, json_result, reason, wkb, writer};
 use crate::{db, error, files::FileStore, geom::MAX_VERTICES};
 
 /// The largest file a tool call may carry. Larger files go through
 /// `POST /api/files`.
-pub const MAX_TOOL_FILE: usize = 25 * 1024 * 1024;
+const MAX_TOOL_FILE: usize = 25 * MIB;
 /// The geometry an object may have. The same list is a CHECK on `object.geom`.
 pub(super) const OBJECT_GEOMETRY_TYPES: &[&str] = &[
     "POINT",
@@ -455,19 +455,28 @@ impl House {
         let bytes = match (p.text, p.base64) {
             (Some(text), None) => {
                 if text.len() > MAX_TOOL_FILE {
-                    return Err(error::invalid("text", "is larger than 25 MiB"));
+                    return Err(error::invalid(
+                        "text",
+                        format!("is larger than {} MiB", MAX_TOOL_FILE / MIB),
+                    ));
                 }
                 text.into_bytes()
             }
             (None, Some(encoded)) => {
                 if encoded.len() > MAX_TOOL_FILE.div_ceil(3) * 4 + 4 {
-                    return Err(error::invalid("base64", "decodes to more than 25 MiB"));
+                    return Err(error::invalid(
+                        "base64",
+                        format!("decodes to more than {} MiB", MAX_TOOL_FILE / MIB),
+                    ));
                 }
                 let bytes = STANDARD
                     .decode(encoded.trim())
                     .map_err(|e| error::invalid("base64", format!("not base64: {e}")))?;
                 if bytes.len() > MAX_TOOL_FILE {
-                    return Err(error::invalid("base64", "decodes to more than 25 MiB"));
+                    return Err(error::invalid(
+                        "base64",
+                        format!("decodes to more than {} MiB", MAX_TOOL_FILE / MIB),
+                    ));
                 }
                 bytes
             }

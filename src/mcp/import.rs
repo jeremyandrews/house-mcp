@@ -175,7 +175,7 @@ impl House {
         .bind(file.id)
         .bind(file.sha.as_str())
         .bind(p.floor_id)
-        .bind(json!(parsed.unit).as_str().unwrap_or_default())
+        .bind(parsed.unit.name())
         .bind(&options)
         .bind(&summary)
         .fetch_one(&mut *tx)

@@ -4,7 +4,7 @@
 mod common;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::{TestDb, two_room_dxf};
+use common::{TestDb, drawing, on_layer, rectangle, save, two_room_dxf};
 use house_mcp::config::{Config, Token};
 use resvg::tiny_skia::Pixmap;
 use rmcp::{
@@ -890,6 +890,10 @@ async fn geometry_names_and_reasons_are_checked_and_named() {
     for origin in [
         json!({"epsg": 32632, "x": 1e15, "y": 1e15}),
         json!({"epsg": 4326, "x": 10.0, "y": 1000.0}),
+        // South of the equator, which zone 32N does not cover.
+        json!({"epsg": 4326, "x": 9.0, "y": -1.0}),
+        // East of the zone's easting range.
+        json!({"epsg": 32632, "x": 900000.0, "y": 5000000.0}),
     ] {
         let error = refused(
             call(
@@ -947,4 +951,180 @@ async fn geometry_names_and_reasons_are_checked_and_named() {
         .await,
     );
     assert!(!error.contains("larger than"), "{error}");
+}
+
+#[tokio::test]
+async fn ordering_links_and_long_names() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let site = ok(
+        &rw,
+        "create_site",
+        json!({"name": "Order", "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("site id");
+    let floor = ok(
+        &rw,
+        "upsert_floor",
+        json!({"site_id": site, "name": "Ground", "level": 0, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("floor id");
+
+    // Nearest first, both from nearest and from what_is_at.
+    let mut lights = Vec::new();
+    for (name, x) in [("far", 5.0), ("near", 1.0)] {
+        let id = ok(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "floor_id": floor, "kind": "light", "name": name,
+                   "geometry": {"type": "Point", "coordinates": [x, 0.0]}, "reason": "test"}),
+        )
+        .await["id"]
+            .as_i64()
+            .expect("light id");
+        lights.push(id);
+    }
+    let (far, near) = (lights[0], lights[1]);
+    let found = ok(
+        &rw,
+        "nearest",
+        json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
+    )
+    .await;
+    let ids: Vec<_> = found
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|o| o["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(near), json!(far)]);
+    let at = ok(
+        &rw,
+        "what_is_at",
+        json!({"site_id": site, "floor_id": floor, "x": 0.0, "y": 0.0, "radius": 10.0}),
+    )
+    .await;
+    let ids: Vec<_> = at["objects"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|o| o["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(near), json!(far)]);
+
+    // list_files filters by what a file is linked to.
+    ok(
+        &rw,
+        "upload_file",
+        json!({"name": "a.txt", "text": "a", "links": {"site_id": site}, "reason": "test"}),
+    )
+    .await;
+    ok(
+        &rw,
+        "upload_file",
+        json!({"name": "b.txt", "text": "b", "reason": "test"}),
+    )
+    .await;
+    let files = ok(&rw, "list_files", json!({"site_id": site})).await;
+    let names: Vec<_> = files
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|f| f["name"].clone())
+        .collect();
+    assert_eq!(names, [json!("a.txt")]);
+
+    // Feature names are trimmed and measured in characters, and a long name
+    // with a part suffix is cut rather than refused.
+    let square = |x0: f64| {
+        json!([[
+            [x0, 45.0],
+            [x0 + 0.0001, 45.0],
+            [x0 + 0.0001, 45.0001],
+            [x0, 45.0001],
+            [x0, 45.0]
+        ]])
+    };
+    let feature =
+        |geometry: Value, name: String| json!({"type": "Feature", "properties": {"name": name}, "geometry": geometry});
+    for (geometry, name, expected) in [
+        (
+            json!({"type": "Polygon", "coordinates": square(9.0)}),
+            "  Garden  ".to_owned(),
+            "Garden".to_owned(),
+        ),
+        (
+            json!({"type": "Polygon", "coordinates": square(9.001)}),
+            "é".repeat(200),
+            "é".repeat(200),
+        ),
+        (
+            json!({"type": "MultiPolygon", "coordinates": [square(9.002), square(9.003)]}),
+            "p".repeat(200),
+            "p".repeat(200),
+        ),
+    ] {
+        let created = ok(
+            &rw,
+            "import_geojson",
+            json!({"site_id": site, "geojson": feature(geometry, name), "as": "space", "kind": "garden_bed",
+                   "name_property": "name", "reason": "test"}),
+        )
+        .await;
+        assert_eq!(created["created"][0]["name"], json!(expected));
+    }
+
+    // Names a drawing composes from long layer and block names are cut too.
+    let long_block = "B".repeat(250);
+    let long_layer = "L".repeat(250);
+    let mut dxf = drawing(dxf::enums::Units::Meters);
+    dxf.add_block(dxf::Block {
+        name: long_block.clone(),
+        ..Default::default()
+    });
+    for x in [1.0, 2.0] {
+        dxf.add_entity(on_layer(
+            "E-LIGHT",
+            dxf::entities::EntityType::Insert(dxf::entities::Insert {
+                name: long_block.clone(),
+                location: dxf::Point::new(x, 1.0, 0.0),
+                ..Default::default()
+            }),
+        ));
+    }
+    dxf.add_entity(on_layer(&long_layer, rectangle(0.0, 0.0, 3.0, 3.0)));
+    let sha = ok(
+        &rw,
+        "upload_file",
+        json!({"name": "long.dxf", "base64": STANDARD.encode(save(&dxf)), "reason": "test"}),
+    )
+    .await["sha256"]
+        .clone();
+    let layers = json!({ "E-LIGHT": {"object": "light"}, long_layer: {"space": "room"} });
+    let import = ok(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": sha, "floor_id": floor, "layers": layers, "reason": "test"}),
+    )
+    .await;
+    assert_eq!(import["objects"].as_array().expect("objects").len(), 2);
+    assert_eq!(import["spaces"].as_array().expect("spaces").len(), 1);
+
+    // A site without a georeference cannot take geographic input.
+    let bare = ok(&rw, "create_site", json!({"name": "Bare", "reason": "test"})).await["id"]
+        .as_i64()
+        .expect("site id");
+    let error = call(
+        &rw,
+        "import_geojson",
+        json!({"site_id": bare, "geojson": feature(json!({"type": "Polygon", "coordinates": square(9.0)}), "x".into()),
+               "as": "space", "kind": "parcel", "name_property": "name", "reason": "test"}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(error.contains("has no georeference"), "{error}");
 }

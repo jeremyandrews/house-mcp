@@ -473,6 +473,31 @@ fn repeated_long_polylines_stop_at_the_vertex_limit() {
 }
 
 #[test]
+fn polyline_whose_arcs_pass_the_limit_is_skipped_and_reported() {
+    // 300 half circles draw about 36 points each, well past the vertex limit,
+    // while the drawing as a whole stays far below its own.
+    let mut drawing = drawing(Units::Meters);
+    let mut bulged = LwPolyline::default();
+    for i in 0..300 {
+        bulged.vertices.push(dxf::LwPolylineVertex {
+            x: f64::from(i),
+            y: 0.0,
+            bulge: 1.0,
+            ..Default::default()
+        });
+    }
+    drawing.add_entity(on_layer("A-WALL", EntityType::LwPolyline(bulged)));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    assert!(parsed.linework.is_empty());
+    let skipped: Vec<_> = parsed
+        .skipped
+        .iter()
+        .map(|(s, count)| (s.entity.as_str(), s.reason.as_str(), *count))
+        .collect();
+    assert_eq!(skipped, vec![("LWPOLYLINE", "more vertices than the limit", 1)]);
+}
+
+#[test]
 fn mirrored_arc_in_a_rotated_block_is_mirrored_before_it_is_placed() {
     // In the block, the -Z arc round (2, 0) is the arc round (-2, 0) from
     // (-3, 0) to (-2, 1). The insertion turns that 90 degrees and moves it to

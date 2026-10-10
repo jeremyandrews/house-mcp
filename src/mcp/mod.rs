@@ -188,7 +188,8 @@ pub async fn live_file(pool: &PgPool, field: &str, sha: &str) -> Result<LiveFile
 /// The largest stored file an import reads. Parsing builds the whole drawing
 /// or document in memory at many times its size on disk, before any entity or
 /// feature limit can apply.
-pub const MAX_IMPORT_FILE: i64 = 16 * 1024 * 1024;
+const MAX_IMPORT_FILE: i64 = 16 * MIB as i64;
+const MIB: usize = 1024 * 1024;
 
 impl House {
     /// A stored file's bytes for an import, refused before reading when it is
@@ -196,7 +197,13 @@ impl House {
     async fn import_bytes(&self, field: &str, sha: &str) -> Result<(LiveFile, Vec<u8>), ErrorData> {
         let file = live_file(&self.db, field, sha).await?;
         if file.size > MAX_IMPORT_FILE {
-            return Err(error::invalid(field, "is larger than 16 MiB, the most an import reads"));
+            return Err(error::invalid(
+                field,
+                format!(
+                    "is larger than {} MiB, the most an import reads",
+                    MAX_IMPORT_FILE / MIB as i64
+                ),
+            ));
         }
         let bytes = self
             .files

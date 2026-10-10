@@ -54,7 +54,7 @@ impl TestDb {
             }
         }
         conn.execute(sqlx::raw_sql(AssertSqlSafe(format!(
-            "CREATE DATABASE {name} OWNER house"
+            "CREATE DATABASE {name} OWNER house ENCODING 'UTF8' LOCALE 'C' TEMPLATE template0"
         ))))
         .await
         .expect("create database");

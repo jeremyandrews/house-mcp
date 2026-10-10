@@ -15,6 +15,18 @@ pub const MIN_SIDE_PX: u32 = 200;
 pub const MAX_SIDE_PX: u32 = 4096;
 const MARGIN: f64 = 40.0;
 const FOOTER: f64 = 50.0;
+/// The strip right of the plan that the north arrow stands in.
+const NORTH_COLUMN: f64 = 40.0;
+/// How far the arrow and its letter reach from their centre at any rotation:
+/// the tip is 22 px out and the far corner of the N about 24.5 px.
+const ARROW_REACH: f64 = 25.0;
+/// The height of the arrow's centre.
+const ARROW_Y: f64 = MARGIN + 10.0;
+// The arrow clears the plan, the footer and the image edges; see
+// `draw_north_arrow`.
+const _: () = assert!(
+    NORTH_COLUMN > ARROW_REACH && ARROW_Y + ARROW_REACH < 2.0 * MARGIN && MARGIN > ARROW_REACH && ARROW_Y > ARROW_REACH
+);
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
 const HIGHLIGHT: &str = "#e8590c";
 
@@ -73,11 +85,11 @@ impl View {
         let dx = (extent.xmax - extent.xmin).max(1.0);
         let dy = (extent.ymax - extent.ymin).max(1.0);
         let (scale, width, height) = if dx >= dy {
-            let scale = (long_side - 2.0 * MARGIN) / dx;
+            let scale = (long_side - 2.0 * MARGIN - NORTH_COLUMN) / dx;
             (scale, long_side, dy * scale + 2.0 * MARGIN + FOOTER)
         } else {
             let scale = (long_side - 2.0 * MARGIN - FOOTER) / dy;
-            (scale, dx * scale + 2.0 * MARGIN, long_side)
+            (scale, dx * scale + 2.0 * MARGIN + NORTH_COLUMN, long_side)
         };
         Self {
             xmin: extent.xmin,
@@ -124,11 +136,13 @@ fn svg(plan: &Plan, view: &View) -> Result<String, String> {
     for feature in &features {
         draw_feature(&mut out, feature, view)?;
     }
+    open_label_clip(&mut out, view);
     for feature in &features {
         if let Some(label) = &feature.label {
             draw_label(&mut out, label, &feature.style, view);
         }
     }
+    out.push_str("</g>");
     draw_scale_bar(&mut out, view);
     draw_north_arrow(&mut out, view, plan.rotation);
     let _ = write!(
@@ -173,6 +187,27 @@ fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), 
     Ok(())
 }
 
+/// Opens a group that clips labels out of the square the north arrow turns
+/// in. A label is as long as its name, so one that starts near the plan's
+/// right edge would otherwise run under the arrow.
+fn open_label_clip(out: &mut String, view: &View) {
+    let arrow_left = view.width - MARGIN - ARROW_REACH;
+    let arrow_bottom = ARROW_Y + ARROW_REACH;
+    let _ = write!(
+        out,
+        concat!(
+            r#"<clipPath id="labels">"#,
+            r#"<rect width="{arrow_left:.2}" height="{h:.2}"/>"#,
+            r#"<rect y="{arrow_bottom:.2}" width="{w:.2}" height="{h:.2}"/>"#,
+            r#"</clipPath><g clip-path="url(#labels)">"#,
+        ),
+        arrow_left = arrow_left,
+        arrow_bottom = arrow_bottom,
+        w = view.width,
+        h = view.height,
+    );
+}
+
 fn draw_label(out: &mut String, label: &Label, style: &Style, view: &View) {
     let (x, y) = view.px(label.x, label.y);
     let (size, dx, anchor) = match style {
@@ -190,7 +225,7 @@ fn draw_label(out: &mut String, label: &Label, style: &Style, view: &View) {
 
 /// A bar of a round length, about a quarter of the plan's width.
 fn draw_scale_bar(out: &mut String, view: &View) {
-    let target = (view.width - 2.0 * MARGIN) / view.scale / 4.0;
+    let target = (view.width - 2.0 * MARGIN - NORTH_COLUMN) / view.scale / 4.0;
     let metres = round_length(target);
     let length = metres * view.scale;
     let (x, y) = (MARGIN, view.height - 34.0);
@@ -215,9 +250,12 @@ fn draw_scale_bar(out: &mut String, view: &View) {
 }
 
 /// Points at grid north, which is the site's y axis turned back by the
-/// site's rotation.
+/// site's rotation. It stands in its own column right of the plan, near the
+/// top, so at any rotation and any shape it stays off the plan, which ends
+/// `NORTH_COLUMN` to its left, and above the footer, which starts at least
+/// `2 * MARGIN` down.
 fn draw_north_arrow(out: &mut String, view: &View, rotation: f64) {
-    let (x, y) = (view.width - MARGIN, MARGIN + 10.0);
+    let (x, y) = (view.width - MARGIN, ARROW_Y);
     let _ = write!(
         out,
         concat!(

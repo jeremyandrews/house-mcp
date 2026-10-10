@@ -172,7 +172,7 @@ async fn end_to_end() {
     assert_eq!(import["linework"], 5);
     let light = import["objects"][0]["id"].as_i64().expect("light id");
 
-    // What is where.
+    // what_is_at finds the room around a point and the light within a radius.
     let at = ok(
         &rw,
         "what_is_at",
@@ -222,7 +222,7 @@ async fn end_to_end() {
     let inside = ok(&ro, "in_space", json!({"space_id": kitchen})).await;
     assert_eq!(inside["objects"][0]["id"], light);
 
-    // A plan the model can look at.
+    // render_plan returns a PNG at the default size and the SVG with both room names.
     let plan = call(
         &ro,
         "render_plan",

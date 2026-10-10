@@ -1,0 +1,270 @@
+//! The schema on a real PostGIS: the change triggers, the role grants and the
+//! site frame functions.
+
+mod common;
+
+use common::{RO_PASSWORD, TestDb};
+use serde_json::Value;
+use sqlx::{Connection, PgConnection, PgPool};
+
+/// A site, floor, object and note written the way the server writes them.
+async fn seed(pool: &PgPool) -> (i64, i64, i64) {
+    let mut tx = house_mcp::db::begin_write(pool, "jesse", "seeding the test")
+        .await
+        .expect("begin");
+    let site: i64 = sqlx::query_scalar("INSERT INTO site (name) VALUES ('test') RETURNING id")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("site");
+    let floor: i64 =
+        sqlx::query_scalar("INSERT INTO floor (site_id, name, level) VALUES ($1, 'Ground', 0) RETURNING id")
+            .bind(site)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("floor");
+    let object: i64 = sqlx::query_scalar(
+        "INSERT INTO object (site_id, floor_id, kind, name, geom) VALUES ($1, $2, 'light', 'Lamp', ST_MakePoint(1, 2)) RETURNING id",
+    )
+    .bind(site)
+    .bind(floor)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("object");
+    let note: i64 =
+        sqlx::query_scalar("INSERT INTO note (body, site_id) VALUES ('Fuse box in the cellar', $1) RETURNING id")
+            .bind(site)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("note");
+    tx.commit().await.expect("commit");
+    (site, object, note)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct Change {
+    author: String,
+    client: String,
+    reason: String,
+    operation: String,
+    before: Option<Value>,
+    after: Option<Value>,
+}
+
+async fn changes(pool: &PgPool, table: &str, id: i64) -> Vec<Change> {
+    sqlx::query_as(
+        "SELECT author, client, reason, operation, before, after FROM change WHERE table_name = $1 AND row_id = $2 ORDER BY id",
+    )
+    .bind(table)
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .expect("changes")
+}
+
+#[tokio::test]
+async fn server_writes_are_recorded_with_author_and_reason() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (_, object, _) = seed(&pool).await;
+    let rows = changes(&pool, "object", object).await;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        (
+            row.author.as_str(),
+            row.client.as_str(),
+            row.reason.as_str(),
+            row.operation.as_str()
+        ),
+        ("jesse", "house-mcp", "seeding the test", "INSERT")
+    );
+    assert!(row.before.is_none());
+    assert_eq!(row.after.as_ref().map(|a| &a["name"]), Some(&Value::from("Lamp")));
+}
+
+#[tokio::test]
+async fn update_by_qgis_is_recorded_under_its_role_even_when_it_names_an_author() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (_, object, _) = seed(&pool).await;
+    let mut qgis = db.qgis().await;
+    sqlx::query("SELECT set_config('house.author', 'jesse', false)")
+        .execute(&mut qgis)
+        .await
+        .expect("set");
+    sqlx::query("UPDATE object SET name = 'Moved lamp', geom = ST_MakePoint(3, 4) WHERE id = $1")
+        .bind(object)
+        .execute(&mut qgis)
+        .await
+        .expect("house_qgis may update objects");
+    let rows = changes(&pool, "object", object).await;
+    assert_eq!(rows.len(), 2);
+    let row = &rows[1];
+    assert_eq!(
+        (
+            row.author.as_str(),
+            row.client.as_str(),
+            row.reason.as_str(),
+            row.operation.as_str()
+        ),
+        ("house_qgis", "QGIS 3.40", "", "UPDATE")
+    );
+    let before = row.before.as_ref().expect("before");
+    let after = row.after.as_ref().expect("after");
+    assert_eq!(
+        (&before["name"], &after["name"]),
+        (&Value::from("Lamp"), &Value::from("Moved lamp"))
+    );
+    assert_eq!(after["geom"]["coordinates"], serde_json::json!([3, 4]));
+}
+
+#[tokio::test]
+async fn hard_delete_by_qgis_keeps_the_whole_row() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (site, _, note) = seed(&pool).await;
+    let mut qgis = db.qgis().await;
+    sqlx::query("DELETE FROM note WHERE id = $1")
+        .bind(note)
+        .execute(&mut qgis)
+        .await
+        .expect("house_qgis may delete notes");
+    let rows = changes(&pool, "note", note).await;
+    let row = rows.last().expect("a change");
+    assert_eq!((row.author.as_str(), row.operation.as_str()), ("house_qgis", "DELETE"));
+    assert!(row.after.is_none());
+    let before = row.before.as_ref().expect("before");
+    assert_eq!(before["body"], Value::from("Fuse box in the cellar"));
+    assert_eq!(before["site_id"], Value::from(site));
+    assert_eq!(before["id"], Value::from(note));
+}
+
+#[tokio::test]
+async fn qgis_cannot_write_change_files_or_linework() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    seed(&pool).await;
+    let mut qgis = db.qgis().await;
+    for sql in [
+        "UPDATE change SET reason = 'rewritten'",
+        "DELETE FROM change",
+        "INSERT INTO change (author, client, reason, table_name, row_id, operation) VALUES ('x', 'x', 'x', 'site', 1, 'INSERT')",
+        "TRUNCATE change",
+        "UPDATE file SET name = 'x'",
+        "DELETE FROM linework",
+    ] {
+        let error = sqlx::query(sql)
+            .execute(&mut qgis)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was allowed"));
+        let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+        assert_eq!(code.as_deref(), Some("42501"), "{sql}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn read_only_role_reads_but_cannot_write() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    seed(&pool).await;
+    let mut ro = PgConnection::connect_with(&db.options("house_ro", RO_PASSWORD))
+        .await
+        .expect("connect as house_ro");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM change")
+        .fetch_one(&mut ro)
+        .await
+        .expect("may read");
+    assert!(count > 0);
+    let error = sqlx::query("UPDATE site SET name = 'x'")
+        .execute(&mut ro)
+        .await
+        .expect_err("refused");
+    let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("42501"));
+}
+
+/// The site's origin is UTM 32N (500000, 0): the zone's central meridian, 9
+/// degrees east, on the equator. A point 0.001 degrees east and north of it
+/// lies k0 a (0.001 in radians) east, and k0 a (1 - e^2) (0.001 in radians)
+/// north, where k0 = 0.9996 and a, e are the WGS 84 ellipsoid's; the terms
+/// dropped are below a micrometre. The site's y axis is turned 30 degrees
+/// clockwise from grid north.
+#[tokio::test]
+async fn wgs84_point_lands_at_the_expected_local_coordinates_and_back() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let site: i64 = sqlx::query_scalar(
+        "INSERT INTO site (name, origin, rotation) VALUES ('frame', ST_SetSRID(ST_MakePoint(500000, 0), 32632), 30) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("site");
+    let (k0, a, e2) = (0.9996, 6_378_137.0, 0.006_694_379_990_14);
+    let step = 0.001_f64.to_radians();
+    let (east, north) = (k0 * a * step, k0 * a * (1.0 - e2) * step);
+    let (sin, cos) = 30_f64.to_radians().sin_cos();
+    let expected = (east * cos - north * sin, east * sin + north * cos);
+
+    let (x, y, lon, lat): (f64, f64, f64, f64) = sqlx::query_as(
+        "WITH l AS (SELECT house_to_local(ST_SetSRID(ST_MakePoint(9.001, 0.001), 4326), $1) AS g),
+              w AS (SELECT house_from_local(g, $1, 4326) AS g FROM l)
+         SELECT ST_X(l.g), ST_Y(l.g), ST_X(w.g), ST_Y(w.g) FROM l, w",
+    )
+    .bind(site)
+    .fetch_one(&pool)
+    .await
+    .expect("frame functions");
+    assert!(
+        (x - expected.0).abs() < 0.01 && (y - expected.1).abs() < 0.01,
+        "({x}, {y}) vs {expected:?}"
+    );
+    // 1 cm is about 9e-8 degrees here.
+    assert!(
+        (lon - 9.001).abs() < 9e-8 && (lat - 0.001).abs() < 9e-8,
+        "({lon}, {lat})"
+    );
+}
+
+#[tokio::test]
+async fn frame_functions_refuse_a_site_without_a_georeference() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let site: i64 = sqlx::query_scalar("INSERT INTO site (name) VALUES ('nowhere') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .expect("site");
+    let error = sqlx::query("SELECT house_to_local(ST_SetSRID(ST_MakePoint(9, 45), 4326), $1)")
+        .bind(site)
+        .execute(&pool)
+        .await
+        .expect_err("refused");
+    assert!(error.to_string().contains("has no georeference"), "{error}");
+}
+
+#[tokio::test]
+async fn linework_refuses_empty_geometry() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (site, _, _) = seed(&pool).await;
+    let import: i64 = sqlx::query_scalar(
+        "WITH f AS (INSERT INTO file (name, media_type, size, sha256) VALUES ('a.dxf', 'image/vnd.dxf', 1, repeat('0', 64)) RETURNING id),
+              fl AS (SELECT id FROM floor WHERE site_id = $1)
+         INSERT INTO dxf_import (file_id, sha256, floor_id, unit, options, summary)
+         SELECT f.id, repeat('0', 64), fl.id, 'm', '{}', '{}' FROM f, fl RETURNING id",
+    )
+    .bind(site)
+    .fetch_one(&pool)
+    .await
+    .expect("import");
+    let error = sqlx::query(
+        "INSERT INTO linework (dxf_import_id, floor_id, layer, entity, geom)
+         SELECT $1, floor_id, '0', 'LINE', 'LINESTRING EMPTY' FROM dxf_import WHERE id = $1",
+    )
+    .bind(import)
+    .execute(&pool)
+    .await
+    .expect_err("refused");
+    let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("23514"), "{error}");
+}

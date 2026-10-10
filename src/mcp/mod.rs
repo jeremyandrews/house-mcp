@@ -30,6 +30,7 @@ use sqlx::PgPool;
 pub use write::{NewFile, store_file};
 
 use crate::{
+    MIB,
     auth::Caller,
     error,
     files::{FileStore, Sha256Hex},
@@ -189,7 +190,6 @@ pub async fn live_file(pool: &PgPool, field: &str, sha: &str) -> Result<LiveFile
 /// or document in memory at many times its size on disk, before any entity or
 /// feature limit can apply.
 const MAX_IMPORT_FILE: i64 = 16 * MIB as i64;
-const MIB: usize = 1024 * 1024;
 
 impl House {
     /// A stored file's bytes for an import, refused before reading when it is

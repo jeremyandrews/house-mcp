@@ -5,10 +5,10 @@ use serde_json::{Value, json};
 use sqlx::Row;
 
 use super::{House, Kind, Links, Location, geojson, json_result, limit, wkb};
-use crate::{error, files::Sha256Hex};
+use crate::{MIB, error, files::Sha256Hex};
 
 /// Text files up to this size come back inline from get_file.
-const INLINE_TEXT_MAX: i64 = 1024 * 1024;
+const INLINE_TEXT_MAX: i64 = MIB as i64;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FloorParams {

@@ -20,6 +20,7 @@ use sqlx::{PgPool, Row};
 use tokio_util::io::ReaderStream;
 
 use crate::{
+    MIB,
     auth::{self, Caller, Tokens},
     files::{FileStore, Sha256Hex},
     markup::escape,
@@ -27,7 +28,7 @@ use crate::{
 };
 
 /// Uploads over HTTP may be larger than over MCP, but not unbounded.
-pub const MAX_HTTP_FILE: usize = 100 * 1024 * 1024;
+pub const MAX_HTTP_FILE: usize = 100 * MIB;
 const PAGE_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:1rem;max-width:48rem}\
 table{border-collapse:collapse;width:100%}td,th{padding:.3rem;border-bottom:1px solid #ddd;text-align:left}\
 form{margin:1rem 0;display:grid;gap:.5rem}";

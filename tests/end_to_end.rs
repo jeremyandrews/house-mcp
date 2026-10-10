@@ -80,12 +80,11 @@ async fn ok(client: &RunningService<RoleClient, ()>, tool: &'static str, args: V
     serde_json::from_str(&text.text).unwrap_or_else(|_| Value::String(text.text.clone()))
 }
 
-fn names(list: &Value, key: &str) -> Vec<String> {
-    let mut names: Vec<String> = list[key]
-        .as_array()
-        .expect("a list")
+/// The names in `list[key]`, sorted, for lists whose order is not promised.
+fn sorted_names(list: &Value, key: &str) -> Vec<String> {
+    let mut names: Vec<String> = column(&list[key], "name")
         .iter()
-        .map(|v| v["name"].as_str().expect("name").to_owned())
+        .map(|name| name.as_str().expect("name").to_owned())
         .collect();
     names.sort();
     names
@@ -166,8 +165,8 @@ async fn end_to_end() {
         json!({"file_sha256": sha, "floor_id": floor, "layers": layers, "reason": "first import"}),
     )
     .await;
-    assert_eq!(names(&import, "spaces"), ["Kitchen", "Living room"]);
-    assert_eq!(names(&import, "objects"), ["LIGHT"]);
+    assert_eq!(sorted_names(&import, "spaces"), ["Kitchen", "Living room"]);
+    assert_eq!(sorted_names(&import, "objects"), ["LIGHT"]);
     assert_eq!(import["unit"], "millimetres");
     assert_eq!(import["linework"], 5);
     let light = import["objects"][0]["id"].as_i64().expect("light id");
@@ -179,14 +178,14 @@ async fn end_to_end() {
         json!({"site_id": site, "floor_id": floor, "x": 1.0, "y": 1.0}),
     )
     .await;
-    assert_eq!(names(&at, "spaces"), ["Kitchen"]);
+    assert_eq!(sorted_names(&at, "spaces"), ["Kitchen"]);
     let at = ok(
         &rw,
         "what_is_at",
         json!({"site_id": site, "floor_id": floor, "x": 7.0, "y": 1.0, "radius": 0.5}),
     )
     .await;
-    assert_eq!(names(&at, "spaces"), ["Living room"]);
+    assert_eq!(sorted_names(&at, "spaces"), ["Living room"]);
     assert_eq!(at["objects"], json!([]));
     let at = ok(
         &ro,
@@ -278,7 +277,7 @@ async fn end_to_end() {
     .await;
     assert_eq!(again["replaced_import_id"], import["import_id"]);
     let floor_now = ok(&ro, "get_floor", json!({"floor_id": floor})).await;
-    assert_eq!(names(&floor_now, "spaces"), ["Kitchen", "Living room"]);
+    assert_eq!(sorted_names(&floor_now, "spaces"), ["Kitchen", "Living room"]);
     assert_eq!(floor_now["objects"].as_array().expect("objects").len(), 1);
 
     // History shows every change to the kitchen: made, then retired by the
@@ -953,28 +952,59 @@ async fn geometry_names_and_reasons_are_checked_and_named() {
     assert!(!error.contains("larger than"), "{error}");
 }
 
-#[tokio::test]
-async fn ordering_links_and_long_names() {
-    let server = start().await;
-    let rw = client(&server, RW).await;
+/// A georeferenced site with one floor, as the tests below start from.
+async fn site_and_floor(rw: &RunningService<RoleClient, ()>, name: &str) -> (i64, i64) {
     let site = ok(
-        &rw,
+        rw,
         "create_site",
-        json!({"name": "Order", "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
+        json!({"name": name, "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
     )
     .await["id"]
         .as_i64()
         .expect("site id");
     let floor = ok(
-        &rw,
+        rw,
         "upsert_floor",
         json!({"site_id": site, "name": "Ground", "level": 0, "reason": "test"}),
     )
     .await["id"]
         .as_i64()
         .expect("floor id");
+    (site, floor)
+}
 
-    // Nearest first, both from nearest and from what_is_at.
+/// One field of every item in a list, in order.
+fn column(list: &Value, key: &str) -> Vec<Value> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|item| item[key].clone())
+        .collect()
+}
+
+/// A square about 8 m across with its south west corner at `lon`, 45° N.
+fn square(lon: f64) -> Value {
+    json!([[
+        [lon, 45.0],
+        [lon + 0.0001, 45.0],
+        [lon + 0.0001, 45.0001],
+        [lon, 45.0001],
+        [lon, 45.0]
+    ]])
+}
+
+/// A GeoJSON Feature with `name` as its one property.
+fn named_feature(geometry: Value, name: String) -> Value {
+    json!({"type": "Feature", "properties": {"name": name}, "geometry": geometry})
+}
+
+#[tokio::test]
+async fn nearest_and_what_is_at_list_the_nearest_first() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Order").await;
+    // The far light is made first, so neither id nor name order is nearest
+    // first.
     let mut lights = Vec::new();
     for (name, x) in [("far", 5.0), ("near", 1.0)] {
         let id = ok(
@@ -984,119 +1014,140 @@ async fn ordering_links_and_long_names() {
                    "geometry": {"type": "Point", "coordinates": [x, 0.0]}, "reason": "test"}),
         )
         .await["id"]
-            .as_i64()
-            .expect("light id");
+            .clone();
         lights.push(id);
     }
-    let (far, near) = (lights[0], lights[1]);
+    let nearest_first = [lights[1].clone(), lights[0].clone()];
     let found = ok(
         &rw,
         "nearest",
         json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
     )
     .await;
-    let ids: Vec<_> = found
-        .as_array()
-        .expect("list")
-        .iter()
-        .map(|o| o["id"].clone())
-        .collect();
-    assert_eq!(ids, [json!(near), json!(far)]);
+    assert_eq!(column(&found, "id"), nearest_first);
     let at = ok(
         &rw,
         "what_is_at",
         json!({"site_id": site, "floor_id": floor, "x": 0.0, "y": 0.0, "radius": 10.0}),
     )
     .await;
-    let ids: Vec<_> = at["objects"]
-        .as_array()
-        .expect("list")
-        .iter()
-        .map(|o| o["id"].clone())
-        .collect();
-    assert_eq!(ids, [json!(near), json!(far)]);
+    assert_eq!(column(&at["objects"], "id"), nearest_first);
+}
 
-    // list_files filters by what a file is linked to.
-    ok(
+#[tokio::test]
+async fn list_files_keeps_to_what_a_file_is_linked_to() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Links").await;
+    let space = ok(
         &rw,
-        "upload_file",
-        json!({"name": "a.txt", "text": "a", "links": {"site_id": site}, "reason": "test"}),
+        "upsert_space",
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Hall", "reason": "test",
+               "geometry": {"type": "Polygon", "coordinates": [[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [0.0, 0.0]]]}}),
     )
-    .await;
-    ok(
+    .await["id"]
+        .clone();
+    let object = ok(
         &rw,
-        "upload_file",
-        json!({"name": "b.txt", "text": "b", "reason": "test"}),
+        "upsert_object",
+        json!({"site_id": site, "floor_id": floor, "kind": "light", "name": "Lamp", "reason": "test",
+               "geometry": {"type": "Point", "coordinates": [1.0, 1.0]}}),
     )
-    .await;
-    let files = ok(&rw, "list_files", json!({"site_id": site})).await;
-    let names: Vec<_> = files
-        .as_array()
-        .expect("list")
-        .iter()
-        .map(|f| f["name"].clone())
-        .collect();
-    assert_eq!(names, [json!("a.txt")]);
+    .await["id"]
+        .clone();
+    // Each file is linked to one thing only, and one to nothing at all.
+    let links = [
+        ("site.txt", json!({"site_id": site})),
+        ("floor.txt", json!({"floor_id": floor})),
+        ("space.txt", json!({"space_id": space})),
+        ("object.txt", json!({"object_id": object})),
+        ("loose.txt", json!({})),
+    ];
+    for (name, link) in &links {
+        ok(
+            &rw,
+            "upload_file",
+            json!({"name": name, "text": name, "links": link, "reason": "test"}),
+        )
+        .await;
+    }
+    for (name, link) in &links[..4] {
+        let files = ok(&rw, "list_files", link.clone()).await;
+        assert_eq!(column(&files, "name"), [json!(name)], "list_files by {link}");
+    }
+}
 
-    // Feature names are trimmed and measured in characters, and a long name
-    // with a part suffix is cut rather than refused.
-    let square = |x0: f64| {
-        json!([[
-            [x0, 45.0],
-            [x0 + 0.0001, 45.0],
-            [x0 + 0.0001, 45.0001],
-            [x0, 45.0001],
-            [x0, 45.0]
-        ]])
-    };
-    let feature =
-        |geometry: Value, name: String| json!({"type": "Feature", "properties": {"name": name}, "geometry": geometry});
-    for (geometry, name, expected) in [
+#[tokio::test]
+async fn geojson_names_are_trimmed_counted_in_characters_and_cut_with_their_part() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, _) = site_and_floor(&rw, "Names").await;
+    let polygon = |lon| json!({"type": "Polygon", "coordinates": square(lon)});
+    let two_parts = |lon| json!({"type": "MultiPolygon", "coordinates": [square(lon), square(lon + 0.0005)]});
+    // 197 characters and a part suffix of four come to 201, so the cut takes
+    // the closing bracket and nothing else.
+    let long = "p".repeat(197);
+    for (geometry, name, stored) in [
+        (polygon(9.0), "  Garden  ".to_owned(), vec!["Garden".to_owned()]),
+        (polygon(9.001), "é".repeat(200), vec!["é".repeat(200)]),
         (
-            json!({"type": "Polygon", "coordinates": square(9.0)}),
-            "  Garden  ".to_owned(),
-            "Garden".to_owned(),
+            two_parts(9.002),
+            "Bed".to_owned(),
+            vec!["Bed (1)".to_owned(), "Bed (2)".to_owned()],
         ),
         (
-            json!({"type": "Polygon", "coordinates": square(9.001)}),
-            "é".repeat(200),
-            "é".repeat(200),
-        ),
-        (
-            json!({"type": "MultiPolygon", "coordinates": [square(9.002), square(9.003)]}),
-            "p".repeat(200),
-            "p".repeat(200),
+            two_parts(9.003),
+            long.clone(),
+            vec![format!("{long} (1"), format!("{long} (2")],
         ),
     ] {
         let created = ok(
             &rw,
             "import_geojson",
-            json!({"site_id": site, "geojson": feature(geometry, name), "as": "space", "kind": "garden_bed",
+            json!({"site_id": site, "geojson": named_feature(geometry, name), "as": "space", "kind": "garden_bed",
                    "name_property": "name", "reason": "test"}),
         )
         .await;
-        assert_eq!(created["created"][0]["name"], json!(expected));
+        assert_eq!(column(&created["created"], "name"), stored);
     }
+}
 
-    // Names a drawing composes from long layer and block names are cut too.
-    let long_block = "B".repeat(250);
+#[tokio::test]
+async fn names_a_drawing_composes_are_cut_and_its_unit_is_stored() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (_, floor) = site_and_floor(&rw, "Drawing").await;
+    let (twice, once) = ("B".repeat(250), "C".repeat(250));
     let long_layer = "L".repeat(250);
-    let mut dxf = drawing(dxf::enums::Units::Meters);
-    dxf.add_block(dxf::Block {
-        name: long_block.clone(),
-        ..Default::default()
-    });
-    for x in [1.0, 2.0] {
+    let mut dxf = drawing(dxf::enums::Units::Feet);
+    for name in [&twice, &once] {
+        dxf.add_block(dxf::Block {
+            name: name.clone(),
+            ..Default::default()
+        });
+    }
+    for (block, x) in [(&twice, 1.0), (&twice, 2.0), (&once, 3.0)] {
         dxf.add_entity(on_layer(
             "E-LIGHT",
             dxf::entities::EntityType::Insert(dxf::entities::Insert {
-                name: long_block.clone(),
+                name: block.clone(),
                 location: dxf::Point::new(x, 1.0, 0.0),
                 ..Default::default()
             }),
         ));
     }
+    // One room with no text inside, and one with a long label.
     dxf.add_entity(on_layer(&long_layer, rectangle(0.0, 0.0, 3.0, 3.0)));
+    dxf.add_entity(on_layer(&long_layer, rectangle(4.0, 0.0, 7.0, 3.0)));
+    dxf.add_entity(on_layer(
+        "A-TEXT",
+        dxf::entities::EntityType::Text(dxf::entities::Text {
+            location: dxf::Point::new(5.0, 1.0, 0.0),
+            text_height: 0.5,
+            value: "T".repeat(250),
+            ..Default::default()
+        }),
+    ));
     let sha = ok(
         &rw,
         "upload_file",
@@ -1111,18 +1162,35 @@ async fn ordering_links_and_long_names() {
         json!({"file_sha256": sha, "floor_id": floor, "layers": layers, "reason": "test"}),
     )
     .await;
-    assert_eq!(import["objects"].as_array().expect("objects").len(), 2);
-    assert_eq!(import["spaces"].as_array().expect("spaces").len(), 1);
+    // Two copies of one block are numbered and a single copy is not, a space
+    // with no text inside is named by its layer and one with text by the
+    // text; every name is cut at 200 characters.
+    assert_eq!(
+        sorted_names(&import, "objects"),
+        ["B".repeat(200), "B".repeat(200), "C".repeat(200)]
+    );
+    assert_eq!(sorted_names(&import, "spaces"), ["L".repeat(200), "T".repeat(200)]);
+    let unit: String = sqlx::query_scalar("SELECT unit FROM dxf_import WHERE id = $1")
+        .bind(import["import_id"].as_i64().expect("import id"))
+        .fetch_one(&mut server.db.qgis().await)
+        .await
+        .expect("the import's row");
+    assert_eq!(unit, "feet");
+}
 
-    // A site without a georeference cannot take geographic input.
+#[tokio::test]
+async fn a_site_without_a_georeference_refuses_geographic_input() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
     let bare = ok(&rw, "create_site", json!({"name": "Bare", "reason": "test"})).await["id"]
         .as_i64()
         .expect("site id");
+    let parcel = named_feature(json!({"type": "Polygon", "coordinates": square(9.0)}), "x".into());
     let error = call(
         &rw,
         "import_geojson",
-        json!({"site_id": bare, "geojson": feature(json!({"type": "Polygon", "coordinates": square(9.0)}), "x".into()),
-               "as": "space", "kind": "parcel", "name_property": "name", "reason": "test"}),
+        json!({"site_id": bare, "geojson": parcel, "as": "space", "kind": "parcel",
+               "name_property": "name", "reason": "test"}),
     )
     .await
     .expect_err("refused");

@@ -223,7 +223,7 @@ impl House {
         .bind(rotation)
         .fetch_one(&mut *tx)
         .await
-        .map_err(error::db)?;
+        .map_err(|e| origin_error(e, p.origin.as_ref()))?;
         tx.commit().await.map_err(error::db)?;
         json_result(json!({ "id": id }))
     }
@@ -764,6 +764,21 @@ pub(super) async fn check_geometry(
         return Err(error::invalid(field, format!("is not valid: {reason}")));
     }
     Ok(())
+}
+
+/// An origin that PostGIS cannot project into UTM zone 32N, or that lands
+/// outside the zone, names the field rather than failing as a server error.
+fn origin_error(error: sqlx::Error, origin: Option<&Origin>) -> ErrorData {
+    let database = error.as_database_error();
+    let outside = database.and_then(|e| e.constraint()) == Some("site_origin_in_zone");
+    let unprojectable = database.and_then(|e| e.code()).is_some_and(|code| code == "XX000");
+    match origin {
+        Some(origin) if outside || unprojectable => error::invalid(
+            "origin",
+            format!("cannot be placed in UTM zone 32N from EPSG:{}", origin.epsg),
+        ),
+        _ => error::db(error),
+    }
 }
 
 #[cfg(test)]

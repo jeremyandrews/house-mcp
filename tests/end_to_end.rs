@@ -4,7 +4,7 @@
 mod common;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::{QGIS_PASSWORD, TestDb, two_room_dxf};
+use common::{TestDb, two_room_dxf};
 use house_mcp::config::{Config, Token};
 use resvg::tiny_skia::Pixmap;
 use rmcp::{
@@ -15,7 +15,6 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, PgConnection};
 
 const RW: &str = "rw-token-for-tests-0123456789abcdef0123456789";
 const RO: &str = "ro-token-for-tests-0123456789abcdef0123456789";
@@ -332,9 +331,7 @@ async fn end_to_end() {
     .await["id"]
         .as_i64()
         .expect("note id");
-    let mut qgis = PgConnection::connect_with(&server.db.options("house_qgis", QGIS_PASSWORD))
-        .await
-        .expect("qgis");
+    let mut qgis = server.db.qgis().await;
     sqlx::query("DELETE FROM note WHERE id = $1")
         .bind(note)
         .execute(&mut qgis)
@@ -545,9 +542,7 @@ async fn awkward_input_is_refused_or_survived() {
 
     // QGIS cannot store one either, nor a curve, which no tool could read
     // back as GeoJSON.
-    let mut qgis = PgConnection::connect_with(&server.db.options("house_qgis", QGIS_PASSWORD))
-        .await
-        .expect("qgis");
+    let mut qgis = server.db.qgis().await;
     for geometry in ["MULTIPOINT EMPTY", "POINT EMPTY", "CIRCULARSTRING(0 0, 1 1, 2 0)"] {
         let error = sqlx::query(
             "INSERT INTO object (site_id, floor_id, kind, name, geom) VALUES ($1, $2, 'light', 'Ghost', $3::geometry)",
@@ -764,4 +759,192 @@ async fn limits_and_refusals_name_their_field() {
     )
     .await;
     assert_eq!(import["spaces"][0]["name"], "Pantry");
+}
+
+#[tokio::test]
+async fn geometry_names_and_reasons_are_checked_and_named() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let http = reqwest::Client::new();
+    let site = ok(
+        &rw,
+        "create_site",
+        json!({"name": "Checks", "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("site id");
+    let refused = |result: Result<CallToolResult, String>| result.expect_err("refused");
+
+    // Every geometry type an object may have is accepted.
+    for geometry in [
+        json!({"type": "Point", "coordinates": [1.0, 1.0]}),
+        json!({"type": "LineString", "coordinates": [[0.0, 0.0], [1.0, 1.0]]}),
+        json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]}),
+        json!({"type": "MultiPoint", "coordinates": [[0.0, 0.0], [1.0, 1.0]]}),
+        json!({"type": "MultiLineString", "coordinates": [[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]}),
+        json!({"type": "MultiPolygon", "coordinates": [[[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]]}),
+    ] {
+        ok(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "kind": "pipe", "name": "p", "geometry": geometry, "reason": "test"}),
+        )
+        .await;
+    }
+    let collection =
+        json!({"type": "GeometryCollection", "geometries": [{"type": "Point", "coordinates": [1.0, 1.0]}]});
+    let error = refused(
+        call(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "kind": "pipe", "name": "p", "geometry": collection, "reason": "test"}),
+        )
+        .await,
+    );
+    assert!(error.contains("geometry: is a GEOMETRYCOLLECTION"), "{error}");
+
+    // A space must be one valid polygon of a bounded size.
+    let line = json!({"type": "LineString", "coordinates": [[0.0, 0.0], [1.0, 1.0]]});
+    let error = refused(
+        call(
+            &rw,
+            "upsert_space",
+            json!({"site_id": site, "name": "s", "kind": "room", "geometry": line, "reason": "test"}),
+        )
+        .await,
+    );
+    assert!(error.contains("geometry: is a LINESTRING"), "{error}");
+    let bowtie =
+        json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]]});
+    let error = refused(
+        call(
+            &rw,
+            "upsert_space",
+            json!({"site_id": site, "name": "s", "kind": "room", "geometry": bowtie, "reason": "test"}),
+        )
+        .await,
+    );
+    assert!(error.contains("geometry: is not valid"), "{error}");
+    let long: Vec<[f64; 2]> = (0..10_001).map(|i| [f64::from(i), 0.0]).collect();
+    let error = refused(
+        call(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "kind": "cable_run", "name": "c", "geometry": {"type": "LineString", "coordinates": long}, "reason": "test"}),
+        )
+        .await,
+    );
+    assert!(error.contains("geometry: has more than 10000 vertices"), "{error}");
+
+    // A NUL inside jsonb is refused by name, like one in text.
+    let error = refused(
+        call(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "kind": "light", "name": "l", "geometry": {"type": "Point", "coordinates": [0.0, 0.0]}, "refs": {"ha_entity_id": "a\u{0}b"}, "reason": "test"}),
+        )
+        .await,
+    );
+    assert!(error.contains("input: contains a NUL character"), "{error}");
+
+    // Imported features are checked the same way, and name the feature.
+    let feature =
+        |geometry: Value, name: &str| json!({"type": "Feature", "properties": {"name": name}, "geometry": geometry});
+    let near_origin = json!({"type": "LineString", "coordinates": [[9.0, 45.0], [9.0001, 45.0001]]});
+    for (geometry, name, expected) in [
+        (near_origin.clone(), "line", "features[0]: is a LINESTRING"),
+        (
+            json!({"type": "Point", "coordinates": [10.0, 1000.0]}),
+            "far",
+            "features[0]: coordinates cannot be converted from EPSG:4326",
+        ),
+        (
+            json!({"type": "Point", "coordinates": [9.0, 45.0]}),
+            "   ",
+            "features[0]: has a blank name",
+        ),
+        (
+            json!({"type": "Point", "coordinates": [9.0, 45.0]}),
+            &"n".repeat(201),
+            "features[0]: has a name longer than 200 characters",
+        ),
+    ] {
+        let target = if expected.contains("LINESTRING") {
+            "space"
+        } else {
+            "object"
+        };
+        let error = refused(
+            call(
+                &rw,
+                "import_geojson",
+                json!({"site_id": site, "geojson": feature(geometry, name), "as": target, "kind": if target == "space" { "parcel" } else { "tree" }, "name_property": "name", "reason": "test"}),
+            )
+            .await,
+        );
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+
+    // An origin that cannot be placed in UTM zone 32N is refused by name.
+    for origin in [
+        json!({"epsg": 32632, "x": 1e15, "y": 1e15}),
+        json!({"epsg": 4326, "x": 10.0, "y": 1000.0}),
+    ] {
+        let error = refused(
+            call(
+                &rw,
+                "create_site",
+                json!({"name": "Nowhere", "origin": origin, "reason": "test"}),
+            )
+            .await,
+        );
+        assert!(error.contains("origin: cannot be placed in UTM zone 32N"), "{error}");
+    }
+
+    // A blank reason is refused on every upload path.
+    let error = refused(
+        call(
+            &rw,
+            "upload_file",
+            json!({"name": "a.txt", "text": "a", "reason": "   "}),
+        )
+        .await,
+    );
+    assert!(error.contains("reason: is required"), "{error}");
+    let blank = http
+        .post(format!("{}/api/files?name=b.txt&reason=%20", server.base))
+        .bearer_auth(RW)
+        .body("b")
+        .send()
+        .await
+        .expect("upload");
+    assert_eq!(blank.status(), 400);
+
+    // A file of exactly the import cap is read, not refused for its size.
+    let at_cap = http
+        .post(format!("{}/api/files?name=cap.dxf&reason=test", server.base))
+        .bearer_auth(RW)
+        .body(vec![b' '; 16 * 1024 * 1024])
+        .send()
+        .await
+        .expect("upload");
+    let at_cap: Value = at_cap.json().await.expect("json");
+    let floor = ok(
+        &rw,
+        "upsert_floor",
+        json!({"site_id": site, "name": "Ground", "level": 0, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("floor id");
+    let error = refused(
+        call(
+            &rw,
+            "import_dxf",
+            json!({"file_sha256": at_cap["sha256"], "floor_id": floor, "reason": "test"}),
+        )
+        .await,
+    );
+    assert!(!error.contains("larger than"), "{error}");
 }

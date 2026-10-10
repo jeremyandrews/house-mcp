@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use super::{House, Kind, Location, geojson, json_result, limit, wkb};
+use super::{House, Kind, Links, Location, geojson, json_result, limit, wkb};
 use crate::{error, files::Sha256Hex};
 
 /// Text files up to this size come back inline from get_file.
@@ -69,10 +69,8 @@ pub struct MeasureParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
-    pub site_id: Option<i64>,
-    pub floor_id: Option<i64>,
-    pub space_id: Option<i64>,
-    pub object_id: Option<i64>,
+    #[serde(flatten)]
+    pub links: Links,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -400,10 +398,10 @@ impl House {
                AND ($4::bigint IS NULL OR object_id = $4)
              ORDER BY created_at DESC, id DESC",
         )
-        .bind(p.site_id)
-        .bind(p.floor_id)
-        .bind(p.space_id)
-        .bind(p.object_id)
+        .bind(p.links.site_id)
+        .bind(p.links.floor_id)
+        .bind(p.links.space_id)
+        .bind(p.links.object_id)
         .fetch_all(&self.db)
         .await
         .map_err(error::db)?;

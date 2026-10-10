@@ -224,6 +224,14 @@ impl<'a> Reader<'a> {
         *self.out.skipped.entry(key).or_default() += 1;
     }
 
+    fn count_vertices(&mut self, n: usize) -> Result<(), ImportError> {
+        self.vertices += n;
+        if self.vertices > MAX_TOTAL_VERTICES {
+            return Err(ImportError::TooManyVertices);
+        }
+        Ok(())
+    }
+
     /// Counts the shape's vertices against the drawing's limit, and skips a
     /// shape whose coordinates overflowed: huge scales or coordinates in a
     /// file end up as infinities, which GeoJSON cannot carry. Returns whether
@@ -239,10 +247,7 @@ impl<'a> Reader<'a> {
             Shape::Point(point) => std::slice::from_ref(point),
             Shape::Line(points) => points,
         };
-        self.vertices += points.len();
-        if self.vertices > MAX_TOTAL_VERTICES {
-            return Err(ImportError::TooManyVertices);
-        }
+        self.count_vertices(points.len())?;
         if !points.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
             self.skip(layer, entity, "coordinates out of range");
             return Ok(false);
@@ -422,13 +427,16 @@ impl<'a> Reader<'a> {
         closed: bool,
         at: &Affine,
     ) -> Result<(), ImportError> {
-        let points = polyline_points(vertices, closed);
+        // A skipped polyline still counts, so a block of oversized ones
+        // inserted many times stops at the drawing's limit rather than being
+        // expanded and thrown away again and again.
+        let Some(points) = polyline_points(vertices, closed) else {
+            self.count_vertices(vertices.len())?;
+            self.skip(layer, entity, "more vertices than the limit");
+            return Ok(());
+        };
         if points.len() < 2 {
             self.skip(layer, entity, "fewer than two vertices");
-            return Ok(());
-        }
-        if points.len() > MAX_VERTICES {
-            self.skip(layer, entity, "more vertices than the limit");
             return Ok(());
         }
         let points = at.apply_all(&points);
@@ -540,8 +548,13 @@ fn arc_points(cx: f64, cy: f64, radius: f64, start: f64, end: f64) -> Vec<(f64, 
 }
 
 /// A polyline's vertices with its bulges drawn as arcs. A closed polyline
-/// repeats its first point at the end.
-fn polyline_points(vertices: &[(f64, f64, f64)], closed: bool) -> Vec<(f64, f64)> {
+/// repeats its first point at the end. `None` once the result would pass the
+/// vertex limit, checked as the arcs are drawn so an oversized one is never
+/// built in full.
+fn polyline_points(vertices: &[(f64, f64, f64)], closed: bool) -> Option<Vec<(f64, f64)>> {
+    if vertices.len() > MAX_VERTICES {
+        return None;
+    }
     let mut points = Vec::with_capacity(vertices.len() + 1);
     let segments = if closed {
         vertices.len()
@@ -556,8 +569,11 @@ fn polyline_points(vertices: &[(f64, f64, f64)], closed: bool) -> Vec<(f64, f64)
         let (x1, y1, _) = vertices[(i + 1) % vertices.len()];
         points.extend(bulge_points((x0, y0), (x1, y1), bulge));
         points.push((x1, y1));
+        if points.len() > MAX_VERTICES {
+            return None;
+        }
     }
-    points
+    Some(points)
 }
 
 /// The points strictly between two polyline vertices joined by a bulge: the
@@ -704,9 +720,21 @@ mod tests {
     }
 
     #[test]
+    fn bulges_that_would_pass_the_vertex_limit_stop_early() {
+        // Half circles of 36 segments each: 300 vertices stay well inside the
+        // limit, while 300 bulged ones would pass it.
+        let straight: Vec<_> = (0..300).map(|i| (f64::from(i), 0.0, 0.0)).collect();
+        assert_eq!(polyline_points(&straight, false).map(|p| p.len()), Some(300));
+        let bulged: Vec<_> = (0..300).map(|i| (f64::from(i), 0.0, 1.0)).collect();
+        assert!(polyline_points(&bulged, false).is_none());
+        let too_many: Vec<_> = (0..=MAX_VERTICES).map(|i| (i as f64, 0.0, 0.0)).collect();
+        assert!(polyline_points(&too_many, false).is_none());
+    }
+
+    #[test]
     fn closed_polyline_ends_where_it_starts() {
         let square = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)];
-        let points = polyline_points(&square, true);
+        let points = polyline_points(&square, true).expect("within the limit");
         assert_eq!(points.len(), 5);
         assert!(close(points[0], points[4]));
     }

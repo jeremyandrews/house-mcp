@@ -557,10 +557,15 @@ fn downward_text_and_insert_are_mirrored_and_tilted_ones_skipped() {
     };
     label.normal = down.clone();
     drawing.add_entity(on_layer("A-TEXT", EntityType::Text(label)));
-    drawing.add_block(Block {
+    let mut light = Block {
         name: "LIGHT".into(),
         ..Default::default()
-    });
+    };
+    light.entities.push(Entity::new(EntityType::Line(Line::new(
+        Point::new(0.0, 0.0, 0.0),
+        Point::new(1.0, 0.0, 0.0),
+    ))));
+    drawing.add_block(light);
     for (x, normal) in [(5.0, down), (7.0, dxf::Vector::new(0.6, 0.0, 0.8))] {
         drawing.add_entity(on_layer(
             "E-LIGHT",
@@ -577,10 +582,64 @@ fn downward_text_and_insert_are_mirrored_and_tilted_ones_skipped() {
     assert_eq!(text.geometry["coordinates"], json!([-5.0, 1.0]));
     assert_eq!(parsed.objects.len(), 1);
     assert_eq!(parsed.objects[0].point["coordinates"], json!([-5.0, 2.0]));
+    // The block's contents are mirrored with it, not just its insertion point.
+    let line = parsed
+        .linework
+        .iter()
+        .find(|l| l.entity == "LINE")
+        .expect("the block's line");
+    assert_eq!(line.geometry["coordinates"], json!([[-5.0, 2.0], [-6.0, 2.0]]));
     let skips: Vec<_> = parsed
         .skipped
         .iter()
         .map(|(s, n)| (s.entity.as_str(), s.reason.as_str(), *n))
         .collect();
     assert_eq!(skips, [("INSERT", "extrusion is not along the z axis", 1)]);
+}
+
+#[test]
+fn oversized_bulged_polylines_count_toward_the_vertex_limit() {
+    // Each copy is skipped for having too many vertices once its arcs are
+    // drawn. Without counting the skipped ones the reader would expand all
+    // 1,000 copies and still accept the drawing.
+    let mut drawing = drawing(Units::Meters);
+    let mut bulged = LwPolyline::default();
+    for i in 0..9_000 {
+        bulged.vertices.push(dxf::LwPolylineVertex {
+            x: f64::from(i),
+            y: 0.0,
+            bulge: 1.0,
+            ..Default::default()
+        });
+    }
+    let mut block = Block {
+        name: "BULGED".into(),
+        ..Default::default()
+    };
+    block.entities.push(Entity::new(EntityType::LwPolyline(bulged)));
+    drawing.add_block(block);
+    for _ in 0..1_000 {
+        drawing.add_entity(Entity::new(insert("BULGED")));
+    }
+    let error = parse(&save(&drawing), &options(None, Transform::default()))
+        .err()
+        .expect("refused");
+    assert!(matches!(error, ImportError::TooManyVertices), "{error}");
+}
+
+#[test]
+fn nul_in_text_is_dropped() {
+    let mut drawing = drawing(Units::Meters);
+    drawing.add_entity(on_layer(
+        "A-TEXT",
+        EntityType::Text(dxf::entities::Text {
+            location: Point::new(1.0, 1.0, 0.0),
+            text_height: 0.2,
+            value: "Ki\0tchen".into(),
+            ..Default::default()
+        }),
+    ));
+    let parsed = parse(&save(&drawing), &options(None, Transform::default())).expect("reads");
+    let text = parsed.linework.iter().find(|l| l.entity == "TEXT").expect("text");
+    assert_eq!(text.text.as_deref(), Some("Kitchen"));
 }

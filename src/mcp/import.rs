@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use sqlx::{PgConnection, Row};
 
 use super::{
-    House, json_result, reason,
+    House, json_result, reason, wkb,
     write::{OBJECT_GEOMETRY_TYPES, check_epsg, check_geometry, check_space_kind, object_kind},
     writer,
 };
@@ -253,11 +253,14 @@ fn feature_row(p: &ImportGeoJsonParams, i: usize, feature: &Value) -> Result<Fea
         }
         FeatureTarget::Object => object_kind(&field, &kind)?,
     };
-    let name = property(&p.name_property).unwrap_or_else(|| format!("{kind} {}", i + 1));
+    let name = match property(&p.name_property) {
+        Some(name) => feature_name(&field, &name)?,
+        None => format!("{kind} {}", i + 1),
+    };
     let geometry = feature
         .get("geometry")
         .ok_or_else(|| error::invalid(&field, "has no geometry"))?;
-    let wkb = crate::geom::to_wkb(geometry).map_err(|e| error::invalid(&field, e))?;
+    let wkb = wkb(&field, geometry)?;
     Ok(FeatureRow { field, name, kind, wkb })
 }
 
@@ -276,7 +279,7 @@ async fn insert_feature(
             .bind(p.site_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(error::db)?;
+            .map_err(|e| conversion_error(e, &row.field, epsg))?;
     let allowed = match p.target {
         FeatureTarget::Space => &["POLYGON", "MULTIPOLYGON"][..],
         FeatureTarget::Object => OBJECT_GEOMETRY_TYPES,
@@ -285,7 +288,7 @@ async fn insert_feature(
     let sql = match p.target {
         FeatureTarget::Space => {
             "INSERT INTO space (site_id, floor_id, name, kind, geom)
-             SELECT $2, $3, CASE WHEN count(*) OVER () > 1 THEN $4 || ' (' || d.path[1] || ')' ELSE $4 END, $5, d.geom
+             SELECT $2, $3, CASE WHEN count(*) OVER () > 1 THEN left($4 || ' (' || d.path[1] || ')', 200) ELSE $4 END, $5, d.geom
              FROM ST_Dump(ST_GeomFromWKB($1, 0)) AS d
              RETURNING id"
         }
@@ -391,7 +394,7 @@ async fn insert_spaces(
              FROM unnest($4::bytea[], $5::text[], $6::text[]) WITH ORDINALITY AS u(wkb, kind, layer, n)
          ), inserted AS (
              INSERT INTO space (site_id, floor_id, name, kind, geom, dxf_import_id)
-             SELECT $2, $3, coalesce(left(btrim(label.text), 200), c.layer || ' ' || c.n), c.kind, c.geom, $1
+             SELECT $2, $3, coalesce(left(btrim(label.text), 200), left(c.layer || ' ' || c.n, 200)), c.kind, c.geom, $1
              FROM candidate c
              LEFT JOIN LATERAL (
                  SELECT l.text FROM linework l
@@ -452,8 +455,8 @@ async fn insert_objects(
         "INSERT INTO object (site_id, floor_id, kind, name, geom, attributes, dxf_import_id)
          SELECT $2, $3, u.kind,
                 CASE WHEN count(*) OVER (PARTITION BY u.block) > 1
-                     THEN u.block || ' ' || row_number() OVER (PARTITION BY u.block ORDER BY u.n)
-                     ELSE u.block END,
+                     THEN left(u.block || ' ' || row_number() OVER (PARTITION BY u.block ORDER BY u.n), 200)
+                     ELSE left(u.block, 200) END,
                 ST_GeomFromWKB(u.wkb, 0), jsonb_build_object('dxf_block', u.block, 'dxf_layer', u.layer), $1
          FROM unnest($4::bytea[], $5::text[], $6::text[], $7::text[]) WITH ORDINALITY AS u(wkb, kind, block, layer, n)
          RETURNING id, name, kind",
@@ -485,4 +488,30 @@ fn skipped_json(parsed: &Parsed) -> Vec<Value> {
 /// By name or by the "AC10" version string every DWG file starts with.
 fn is_dwg(name: &str, bytes: &[u8]) -> bool {
     name.to_ascii_lowercase().ends_with(".dwg") || bytes.starts_with(b"AC10")
+}
+
+/// A feature's own name, trimmed. Refused rather than cut, because the caller
+/// chose it and a silently shortened name would not be the one they look for.
+fn feature_name(field: &str, name: &str) -> Result<String, ErrorData> {
+    let name = name.trim();
+    match name.chars().count() {
+        0 => Err(error::invalid(field, "has a blank name")),
+        1..=200 => Ok(name.to_owned()),
+        _ => Err(error::invalid(field, "has a name longer than 200 characters")),
+    }
+}
+
+/// A feature whose coordinates PostGIS cannot carry into the site frame is the
+/// caller's mistake; a site without a georeference keeps its own message.
+fn conversion_error(error: sqlx::Error, field: &str, epsg: i32) -> ErrorData {
+    let georeference = error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == "22023");
+    match &error {
+        sqlx::Error::Database(_) if !georeference => {
+            error::invalid(field, format!("coordinates cannot be converted from EPSG:{epsg}"))
+        }
+        _ => error::db(error),
+    }
 }

@@ -140,7 +140,7 @@ impl House {
 impl House {
     async fn linework_features(&self, floor_id: i64) -> Result<Vec<Feature>, ErrorData> {
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT ST_AsBinary(geom) FROM linework WHERE floor_id = $1 AND deleted_at IS NULL AND text IS NULL AND NOT ST_IsEmpty(geom)",
+            "SELECT ST_AsBinary(geom) FROM linework WHERE floor_id = $1 AND deleted_at IS NULL AND text IS NULL",
         )
         .bind(floor_id)
         .fetch_all(&self.db)
@@ -164,7 +164,7 @@ impl House {
     ) -> Result<Vec<Feature>, ErrorData> {
         let rows = sqlx::query(
             "SELECT id, name, kind, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
-             FROM space WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2 AND NOT ST_IsEmpty(geom)",
+             FROM space WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2",
         )
         .bind(p.site_id)
         .bind(p.floor_id)
@@ -189,7 +189,7 @@ impl House {
     ) -> Result<Vec<Feature>, ErrorData> {
         let rows = sqlx::query(
             "SELECT id, name, kind, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
-             FROM object WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2 AND NOT ST_IsEmpty(geom)
+             FROM object WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2
                AND ($3::text[] IS NULL OR kind = ANY($3))",
         )
         .bind(p.site_id)
@@ -223,8 +223,8 @@ impl House {
     }
 }
 
-/// A row's name at its label point. An empty geometry, which QGIS can store,
-/// has no label point, so it is drawn without one.
+/// A row's name at its label point. ST_PointOnSurface returns NULL for some
+/// invalid polygons QGIS can store, and such a row is drawn without a label.
 fn label(row: &PgRow, wanted: bool) -> Option<Label> {
     let (x, y) = (row.get::<Option<f64>, _>("lx")?, row.get::<Option<f64>, _>("ly")?);
     wanted.then(|| Label {

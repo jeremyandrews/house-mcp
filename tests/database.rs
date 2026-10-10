@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{QGIS_PASSWORD, TestDb};
+use common::{RO_PASSWORD, TestDb};
 use serde_json::Value;
 use sqlx::{Connection, PgConnection, PgPool};
 
@@ -38,12 +38,6 @@ async fn seed(pool: &PgPool) -> (i64, i64, i64) {
             .expect("note");
     tx.commit().await.expect("commit");
     (site, object, note)
-}
-
-async fn qgis(db: &TestDb) -> PgConnection {
-    PgConnection::connect_with(&db.options("house_qgis", QGIS_PASSWORD).application_name("QGIS 3.40"))
-        .await
-        .expect("connect as house_qgis")
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -93,7 +87,7 @@ async fn update_by_qgis_is_recorded_under_its_role_even_when_it_names_an_author(
     let db = TestDb::new().await;
     let pool = db.migrated_pool().await;
     let (_, object, _) = seed(&pool).await;
-    let mut qgis = qgis(&db).await;
+    let mut qgis = db.qgis().await;
     sqlx::query("SELECT set_config('house.author', 'jesse', false)")
         .execute(&mut qgis)
         .await
@@ -129,7 +123,7 @@ async fn hard_delete_by_qgis_keeps_the_whole_row() {
     let db = TestDb::new().await;
     let pool = db.migrated_pool().await;
     let (site, _, note) = seed(&pool).await;
-    let mut qgis = qgis(&db).await;
+    let mut qgis = db.qgis().await;
     sqlx::query("DELETE FROM note WHERE id = $1")
         .bind(note)
         .execute(&mut qgis)
@@ -150,7 +144,7 @@ async fn qgis_cannot_write_change_files_or_linework() {
     let db = TestDb::new().await;
     let pool = db.migrated_pool().await;
     seed(&pool).await;
-    let mut qgis = qgis(&db).await;
+    let mut qgis = db.qgis().await;
     for sql in [
         "UPDATE change SET reason = 'rewritten'",
         "DELETE FROM change",
@@ -174,7 +168,7 @@ async fn read_only_role_reads_but_cannot_write() {
     let db = TestDb::new().await;
     let pool = db.migrated_pool().await;
     seed(&pool).await;
-    let mut ro = PgConnection::connect_with(&db.options("house_ro", "ro-test-password"))
+    let mut ro = PgConnection::connect_with(&db.options("house_ro", RO_PASSWORD))
         .await
         .expect("connect as house_ro");
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM change")
@@ -246,4 +240,31 @@ async fn frame_functions_refuse_a_site_without_a_georeference() {
         .await
         .expect_err("refused");
     assert!(error.to_string().contains("has no georeference"), "{error}");
+}
+
+#[tokio::test]
+async fn linework_refuses_empty_geometry() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (site, _, _) = seed(&pool).await;
+    let import: i64 = sqlx::query_scalar(
+        "WITH f AS (INSERT INTO file (name, media_type, size, sha256) VALUES ('a.dxf', 'image/vnd.dxf', 1, repeat('0', 64)) RETURNING id),
+              fl AS (SELECT id FROM floor WHERE site_id = $1)
+         INSERT INTO dxf_import (file_id, sha256, floor_id, unit, options, summary)
+         SELECT f.id, repeat('0', 64), fl.id, 'm', '{}', '{}' FROM f, fl RETURNING id",
+    )
+    .bind(site)
+    .fetch_one(&pool)
+    .await
+    .expect("import");
+    let error = sqlx::query(
+        "INSERT INTO linework (dxf_import_id, floor_id, layer, entity, geom)
+         SELECT $1, floor_id, '0', 'LINE', 'LINESTRING EMPTY' FROM dxf_import WHERE id = $1",
+    )
+    .bind(import)
+    .execute(&pool)
+    .await
+    .expect_err("refused");
+    let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("23514"), "{error}");
 }

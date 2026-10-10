@@ -7,8 +7,12 @@ CREATE TABLE site (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name        text NOT NULL CHECK (name <> '' AND length(name) <= 200),
     -- The site frame's origin in WGS 84 / UTM zone 32N. Null until someone
-    -- georeferences the site; the frame functions refuse such a site.
-    origin      geometry(Point, 32632),
+    -- georeferences the site; the frame functions refuse such a site. It must
+    -- lie in the zone's northern half, or every later conversion of it fails,
+    -- list_sites included, whichever client stored it.
+    origin      geometry(Point, 32632)
+                CONSTRAINT site_origin_in_zone
+                CHECK (origin IS NULL OR ST_Covers(ST_MakeEnvelope(166000, 0, 834000, 9330000, 32632), origin)),
     -- Degrees clockwise from grid north to the site's y axis.
     rotation    double precision NOT NULL DEFAULT 0 CHECK (rotation > -360 AND rotation < 360),
     created_at  timestamptz NOT NULL DEFAULT now(),

@@ -17,6 +17,7 @@ use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool, postgres::
 
 pub const HOUSE_PASSWORD: &str = "house-test-password";
 pub const QGIS_PASSWORD: &str = "qgis-test-password";
+pub const RO_PASSWORD: &str = "ro-test-password";
 
 pub struct TestDb {
     pub name: String,
@@ -41,7 +42,7 @@ impl TestDb {
         for (role, password) in [
             ("house", HOUSE_PASSWORD),
             ("house_qgis", QGIS_PASSWORD),
-            ("house_ro", "ro-test-password"),
+            ("house_ro", RO_PASSWORD),
         ] {
             let sql = format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'");
             if let Err(e) = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql))).await {
@@ -62,6 +63,13 @@ impl TestDb {
             .expect("connect to test database");
         db.execute("CREATE EXTENSION postgis").await.expect("postgis");
         Self { name, admin }
+    }
+
+    /// A connection as `house_qgis`, named the way QGIS names its own.
+    pub async fn qgis(&self) -> PgConnection {
+        PgConnection::connect_with(&self.options("house_qgis", QGIS_PASSWORD).application_name("QGIS 3.40"))
+            .await
+            .expect("connect as house_qgis")
     }
 
     pub fn options(&self, role: &str, password: &str) -> PgConnectOptions {

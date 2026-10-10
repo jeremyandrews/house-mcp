@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # No postgis/postgis tag carries PostGIS 3.6 on Postgres 16, so the tests
+  # run on the image production runs. It has no entrypoint of its own, so it
+  # is started by hand rather than as a service container.
+  POSTGIS_IMAGE: ghcr.io/cloudnative-pg/postgis:16.15-3.6.4-standard-trixie
+  HOUSE_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Start PostGIS
+        run: |
+          docker run -d --name postgis -p 5432:5432 "$POSTGIS_IMAGE" bash -c '
+            initdb -D /tmp/pg -U postgres --auth=trust >/dev/null &&
+            echo "host all all all trust" >> /tmp/pg/pg_hba.conf &&
+            exec postgres -D /tmp/pg -c listen_addresses="*" -c unix_socket_directories=/tmp'
+          for _ in $(seq 60); do
+            docker exec postgis pg_isready -h /tmp -q && exit 0
+            sleep 1
+          done
+          docker logs postgis
+          exit 1
+      - name: Test
+        run: cargo test --locked
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources

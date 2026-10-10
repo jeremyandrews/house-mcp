@@ -101,10 +101,10 @@ impl House {
         check_epsg(&mut tx, "epsg", epsg).await?;
         let mut created = Vec::with_capacity(rows.len());
         for row in &rows {
-            let ids = insert_feature(&mut tx, &p, epsg, row).await?;
+            let made = insert_feature(&mut tx, &p, epsg, row).await?;
             created.extend(
-                ids.into_iter()
-                    .map(|id| json!({ "id": id, "name": row.name, "kind": row.kind })),
+                made.into_iter()
+                    .map(|(id, name)| json!({ "id": id, "name": name, "kind": row.kind })),
             );
         }
         tx.commit().await.map_err(error::db)?;
@@ -265,13 +265,14 @@ fn feature_row(p: &ImportGeoJsonParams, i: usize, feature: &Value) -> Result<Fea
 }
 
 /// One feature into the site frame and the model. A space takes each polygon
-/// of a multipolygon as its own space.
+/// of a multipolygon as its own space, its name numbered by part. Returns
+/// the id and the stored name of each row made.
 async fn insert_feature(
     tx: &mut PgConnection,
     p: &ImportGeoJsonParams,
     epsg: i32,
     row: &FeatureRow,
-) -> Result<Vec<i64>, ErrorData> {
+) -> Result<Vec<(i64, String)>, ErrorData> {
     let local: Vec<u8> =
         sqlx::query_scalar("SELECT ST_AsBinary(house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3))")
             .bind(&row.wkb)
@@ -290,15 +291,15 @@ async fn insert_feature(
             "INSERT INTO space (site_id, floor_id, name, kind, geom)
              SELECT $2, $3, CASE WHEN count(*) OVER () > 1 THEN left($4 || ' (' || d.path[1] || ')', 200) ELSE $4 END, $5, d.geom
              FROM ST_Dump(ST_GeomFromWKB($1, 0)) AS d
-             RETURNING id"
+             RETURNING id, name"
         }
         FeatureTarget::Object => {
             "INSERT INTO object (site_id, floor_id, name, kind, geom)
              VALUES ($2, $3, $4, $5, ST_GeomFromWKB($1, 0))
-             RETURNING id"
+             RETURNING id, name"
         }
     };
-    sqlx::query_scalar(sql)
+    sqlx::query_as(sql)
         .bind(&local)
         .bind(p.site_id)
         .bind(p.floor_id)

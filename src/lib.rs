@@ -23,9 +23,12 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::{auth::Tokens, config::Config, files::FileStore};
 
+/// Bytes in a mebibyte.
+pub(crate) const MIB: usize = 1024 * 1024;
+
 /// The MCP request limit: a 25 MiB file as base64 with room for the rest of
 /// the call.
-const MAX_MCP_BODY: usize = 36 * 1024 * 1024;
+const MAX_MCP_BODY: usize = 36 * MIB;
 
 /// Connects, migrates and builds every route.
 pub async fn app(config: &Config) -> Result<Router, String> {

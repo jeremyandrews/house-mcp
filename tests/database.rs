@@ -268,3 +268,67 @@ async fn linework_refuses_empty_geometry() {
     let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
     assert_eq!(code.as_deref(), Some("23514"), "{error}");
 }
+
+#[tokio::test]
+async fn linework_and_imports_belong_to_a_floor_or_a_site() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (site, _, _) = seed(&pool).await;
+    let file: i64 = sqlx::query_scalar(
+        "INSERT INTO file (name, media_type, size, sha256) VALUES ('a.dxf', 'image/vnd.dxf', 1, repeat('0', 64)) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("file");
+    let import = |site: Option<i64>| {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO dxf_import (file_id, sha256, site_id, unit, options, summary)
+             VALUES ($1, repeat('0', 64), $2, 'm', '{}', '{}') RETURNING id",
+        )
+        .bind(file)
+        .bind(site)
+        .fetch_one(&pool)
+    };
+    let nowhere = import(None).await.expect_err("an import must have a place");
+    assert_eq!(
+        nowhere.as_database_error().and_then(|e| e.constraint()),
+        Some("dxf_import_has_a_place")
+    );
+    let grounds = import(Some(site)).await.expect("an import onto the site");
+    let twice = import(Some(site))
+        .await
+        .expect_err("one live import of a drawing per site");
+    assert_eq!(
+        twice.as_database_error().and_then(|e| e.constraint()),
+        Some("dxf_import_site_live")
+    );
+    let line = |site: Option<i64>| {
+        sqlx::query(
+            "INSERT INTO linework (dxf_import_id, site_id, layer, entity, geom)
+             VALUES ($1, $2, '0', 'LINE', 'LINESTRING(0 0, 1 1)')",
+        )
+        .bind(grounds)
+        .bind(site)
+        .execute(&pool)
+    };
+    let error = line(None).await.expect_err("linework must have a place");
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.constraint()),
+        Some("linework_has_a_place")
+    );
+    line(Some(site)).await.expect("linework on the site");
+    // Sites and floors start with no attributes, and only an object will do.
+    let attributes: Value = sqlx::query_scalar("SELECT attributes FROM site WHERE id = $1")
+        .bind(site)
+        .fetch_one(&pool)
+        .await
+        .expect("attributes");
+    assert_eq!(attributes, serde_json::json!({}));
+    let error = sqlx::query("UPDATE floor SET attributes = '[]' WHERE site_id = $1")
+        .bind(site)
+        .execute(&pool)
+        .await
+        .expect_err("not an object");
+    let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("23514"), "{error}");
+}

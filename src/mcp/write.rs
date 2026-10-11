@@ -9,7 +9,7 @@ use rmcp::{
     tool, tool_router,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sqlx::{PgConnection, PgPool};
 
@@ -75,6 +75,28 @@ pub struct CreateSiteParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetSiteOriginParams {
+    pub site_id: i64,
+    /// Where the site frame's origin is on the earth, in any EPSG coordinate
+    /// system: `{"epsg": 4326, "x": longitude, "y": latitude}` for WGS 84.
+    pub origin: Origin,
+    /// Degrees clockwise from grid north to the site's y axis. Omit to keep
+    /// the stored rotation.
+    pub rotation: Option<f64>,
+    pub reason: String,
+}
+
+/// A field a caller may leave out, send as null, or send with a value:
+/// `None` when left out, `Some(None)` for null.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpsertFloorParams {
     /// Omit to create a floor; give to replace an existing floor's fields.
     pub id: Option<i64>,
@@ -90,16 +112,24 @@ pub struct UpsertFloorParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpsertSpaceParams {
+    /// Omit to create a space; give to update one, when every field left
+    /// out keeps its stored value.
     pub id: Option<i64>,
     pub site_id: i64,
-    /// Omit for an outdoor area.
-    pub floor_id: Option<i64>,
-    pub name: String,
-    /// room, terrace, garden_bed, pool, parcel or building.
-    pub kind: String,
-    /// A GeoJSON Polygon in the site frame, metres.
-    pub geometry: Value,
-    pub wall_material: Option<String>,
+    /// Null or left out on create for an outdoor area. On update, left out
+    /// keeps the floor and null moves the space outdoors.
+    #[serde(default, deserialize_with = "present")]
+    pub floor_id: Option<Option<i64>>,
+    /// Required on create.
+    pub name: Option<String>,
+    /// room, terrace, garden_bed, pool, parcel or building. Required on
+    /// create.
+    pub kind: Option<String>,
+    /// A GeoJSON Polygon in the site frame, metres. Required on create.
+    pub geometry: Option<Value>,
+    /// On update, left out keeps it and null clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub wall_material: Option<Option<String>>,
     /// Replaces the attributes when given.
     pub attributes: Option<serde_json::Map<String, Value>>,
     pub reason: String,
@@ -107,19 +137,27 @@ pub struct UpsertSpaceParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpsertObjectParams {
+    /// Omit to create an object; give to update one, when every field left
+    /// out keeps its stored value.
     pub id: Option<i64>,
     pub site_id: i64,
-    /// Omit for something outdoors.
-    pub floor_id: Option<i64>,
+    /// Null or left out on create for something outdoors. On update, left
+    /// out keeps the floor and null moves the object outdoors.
+    #[serde(default, deserialize_with = "present")]
+    pub floor_id: Option<Option<i64>>,
     /// light, switch, socket, access_point, camera, sensor, speaker, tree,
-    /// pipe, cable_run, opening, or another lowercase word.
-    pub kind: String,
-    pub name: String,
+    /// pipe, cable_run, opening, or another lowercase word. Required on
+    /// create.
+    pub kind: Option<String>,
+    /// Required on create.
+    pub name: Option<String>,
     /// GeoJSON Point, LineString or Polygon (or a Multi of one) in the site
-    /// frame, metres.
-    pub geometry: Value,
-    /// Metres above the floor, or above the ground outdoors.
-    pub height: Option<f64>,
+    /// frame, metres. Required on create.
+    pub geometry: Option<Value>,
+    /// Metres above the floor, or above the ground outdoors. On update, left
+    /// out keeps it and null clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub height: Option<Option<f64>>,
     /// Replaces the outside identifiers when given; see link_ref to change one.
     pub refs: Option<BTreeMap<String, String>>,
     /// Replaces the attributes when given; see set_attributes to change some.
@@ -130,6 +168,8 @@ pub struct UpsertObjectParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributeKind {
+    Site,
+    Floor,
     Space,
     Object,
 }
@@ -228,6 +268,42 @@ impl House {
         json_result(json!({ "id": id }))
     }
 
+    #[tool(
+        description = "Set or replace where a site's frame is on the earth: its origin, in any EPSG coordinate system, and optionally its rotation, degrees clockwise from grid north to the site's y axis (left out, the stored rotation stays). Stored geometry is in the site frame and does not move; what changes is where that frame lies, which import_geojson and any other conversion use from then on. Recorded in history with the reason, like every write. Returns the origin in WGS 84 and the rotation. Example: {\"site_id\": 3, \"origin\": {\"epsg\": 4326, \"x\": 9.19, \"y\": 45.46}, \"rotation\": 12.5, \"reason\": \"origin at the south west corner of the survey\"}."
+    )]
+    async fn set_site_origin(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<SetSiteOriginParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = &writer(&parts)?.name;
+        let reason = reason(&p.reason)?;
+        if p.rotation.is_some_and(|r| !(r > -360.0 && r < 360.0)) {
+            return Err(error::invalid("rotation", "must be between -360 and 360 degrees"));
+        }
+        if !(p.origin.x.is_finite() && p.origin.y.is_finite()) {
+            return Err(error::invalid("origin", "x and y must be numbers"));
+        }
+        let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
+        check_epsg(&mut tx, "origin.epsg", p.origin.epsg).await?;
+        let row: Option<(f64, f64, f64)> = sqlx::query_as(
+            "UPDATE site SET origin = ST_Transform(ST_SetSRID(ST_MakePoint($2, $3), $4), 32632), rotation = coalesce($5, rotation)
+             WHERE id = $1 AND deleted_at IS NULL
+             RETURNING ST_X(ST_Transform(origin, 4326)), ST_Y(ST_Transform(origin, 4326)), rotation",
+        )
+        .bind(p.site_id)
+        .bind(p.origin.x)
+        .bind(p.origin.y)
+        .bind(p.origin.epsg)
+        .bind(p.rotation)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| origin_error(e, Some(&p.origin)))?;
+        let (lon, lat, rotation) = row.ok_or_else(|| error::invalid("site_id", "no live site with this id"))?;
+        tx.commit().await.map_err(error::db)?;
+        json_result(json!({ "id": p.site_id, "origin_wgs84": { "lon": lon, "lat": lat }, "rotation": rotation }))
+    }
+
     #[tool(description = "Create a floor, or replace an existing floor's fields when `id` is given.")]
     async fn upsert_floor(
         &self,
@@ -265,7 +341,7 @@ impl House {
     }
 
     #[tool(
-        description = "Create a space (a room, terrace, garden bed, pool, parcel or building outline), or replace an existing one's fields when `id` is given."
+        description = "Create a space (a room, terrace, garden bed, pool, parcel or building outline), or update one when `id` is given. On create, `name`, `kind` and `geometry` are required. On update every field but `id`, `site_id` and `reason` is optional, and a field left out keeps its stored value, so a rename is {\"id\": 7, \"site_id\": 1, \"name\": \"Pantry\", \"reason\": \"...\"}; send `floor_id` or `wall_material` as null to clear it. `attributes`, when given, replaces them all; set_attributes changes some."
     )]
     async fn upsert_space(
         &self,
@@ -274,30 +350,49 @@ impl House {
     ) -> Result<CallToolResult, ErrorData> {
         let author = &writer(&parts)?.name;
         let reason = reason(&p.reason)?;
-        check_space_kind("kind", &p.kind)?;
-        let geometry = wkb("geometry", &p.geometry)?;
+        if p.id.is_none() {
+            required_on_create(
+                "space",
+                [
+                    ("name", p.name.is_some()),
+                    ("kind", p.kind.is_some()),
+                    ("geometry", p.geometry.is_some()),
+                ],
+            )?;
+        }
+        if let Some(kind) = &p.kind {
+            check_space_kind("kind", kind)?;
+        }
+        let geometry = p.geometry.as_ref().map(|g| wkb("geometry", g)).transpose()?;
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
-        check_geometry(&mut tx, "geometry", &geometry, &["POLYGON"]).await?;
+        if let Some(geometry) = &geometry {
+            check_geometry(&mut tx, "geometry", geometry, &["POLYGON"]).await?;
+        }
         let id: Option<i64> = sqlx::query_scalar(
             "WITH created AS (
                  INSERT INTO space (site_id, floor_id, name, kind, geom, wall_material, attributes)
                  SELECT $2, $3, $4, $5, ST_GeomFromWKB($6, 0), $7, coalesce($8, '{}')
                  WHERE $1::bigint IS NULL RETURNING id
              ), updated AS (
-                 UPDATE space SET site_id = $2, floor_id = $3, name = $4, kind = $5, geom = ST_GeomFromWKB($6, 0),
-                                  wall_material = $7, attributes = coalesce($8, attributes)
+                 UPDATE space SET site_id = $2, floor_id = CASE WHEN $9 THEN $3 ELSE floor_id END,
+                                  name = coalesce($4, name), kind = coalesce($5, kind),
+                                  geom = coalesce(ST_GeomFromWKB($6, 0), geom),
+                                  wall_material = CASE WHEN $10 THEN $7 ELSE wall_material END,
+                                  attributes = coalesce($8, attributes)
                  WHERE id = $1 AND deleted_at IS NULL RETURNING id
              )
              SELECT id FROM created UNION ALL SELECT id FROM updated",
         )
         .bind(p.id)
         .bind(p.site_id)
-        .bind(p.floor_id)
-        .bind(p.name.trim())
+        .bind(p.floor_id.flatten())
+        .bind(p.name.as_deref().map(str::trim))
         .bind(&p.kind)
         .bind(&geometry)
-        .bind(&p.wall_material)
+        .bind(p.wall_material.clone().flatten())
         .bind(p.attributes.map(Value::Object))
+        .bind(p.floor_id.is_some())
+        .bind(p.wall_material.is_some())
         .fetch_optional(&mut *tx)
         .await
         .map_err(error::db)?;
@@ -307,7 +402,7 @@ impl House {
     }
 
     #[tool(
-        description = "Create an object (a light, switch, socket, access point, camera, sensor, speaker, tree, pipe, cable run, opening or anything else), or replace an existing one's fields when `id` is given. An `opening` is an arch or open doorway that render_plan draws as a gap in the wall: its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. Attribute `opening_type` is `arch` (jamb ticks and a dashed curve) or `opening` (jamb ticks only), default `opening`; `wall_depth` is the wall's thickness in metres, a positive number, default 0.6, and the gap cut is that wide across the wall. Any other geometry is drawn as an ordinary object. Example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Arch to the hall\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[4.0, 1.2], [4.0, 2.8]]}, \"attributes\": {\"opening_type\": \"arch\", \"wall_depth\": 0.45}, \"reason\": \"arch on the survey\"}."
+        description = "Create an object (a light, switch, socket, access point, camera, sensor, speaker, tree, pipe, cable run, opening or anything else), or update one when `id` is given. On create, `kind`, `name` and `geometry` are required. On update every field but `id`, `site_id` and `reason` is optional, and a field left out keeps its stored value, so a rename is {\"id\": 41, \"site_id\": 1, \"name\": \"Reading lamp\", \"reason\": \"...\"}; send `floor_id` or `height` as null to clear it. `refs` and `attributes`, when given, replace them all; link_ref and set_attributes change some.\n\nAn `opening` is a door, arch or open doorway that render_plan draws as a gap in the wall with a jamb tick at each end: its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. Attributes: `opening_type` is `door`, `arch` (two dashed lines across the gap, one along each face of the wall) or `opening` (the gap alone), default `opening`; `wall_depth` is the wall's thickness in metres, a positive number, default 0.6, and the gap cut is that wide across the wall. A door also takes `hinge`, the `start` or `end` of the line the leaf hangs from (default `start`), `swing`, the `left` or `right` of the line's direction it opens towards (default `left`), and `leaves`, 1 or 2 (default 1; 2 hangs a half leaf on each jamb); it is drawn as its leaf square to the wall and the quarter circle of its swing. `connects`, a list of exactly two space ids, says which spaces the opening joins; without it the connections tool finds them from the geometry. Any other geometry is drawn as an ordinary object. Door example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Door to the hall\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[4.0, 1.2], [4.0, 2.1]]}, \"attributes\": {\"opening_type\": \"door\", \"hinge\": \"end\", \"swing\": \"right\", \"wall_depth\": 0.3, \"connects\": [12, 13]}, \"reason\": \"door on the survey\"}. Arch example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Arch to the kitchen\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[7.0, 0.5], [7.0, 2.1]]}, \"attributes\": {\"opening_type\": \"arch\", \"wall_depth\": 0.45}, \"reason\": \"arch on the survey\"}."
     )]
     async fn upsert_object(
         &self,
@@ -316,15 +411,27 @@ impl House {
     ) -> Result<CallToolResult, ErrorData> {
         let author = &writer(&parts)?.name;
         let reason = reason(&p.reason)?;
-        let kind = object_kind("kind", &p.kind)?;
+        if p.id.is_none() {
+            required_on_create(
+                "object",
+                [
+                    ("kind", p.kind.is_some()),
+                    ("name", p.name.is_some()),
+                    ("geometry", p.geometry.is_some()),
+                ],
+            )?;
+        }
+        let kind = p.kind.as_deref().map(|kind| object_kind("kind", kind)).transpose()?;
         if let Some(refs) = &p.refs {
             for key in refs.keys() {
                 check_key("refs", key)?;
             }
         }
-        let geometry = wkb("geometry", &p.geometry)?;
+        let geometry = p.geometry.as_ref().map(|g| wkb("geometry", g)).transpose()?;
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
-        check_geometry(&mut tx, "geometry", &geometry, OBJECT_GEOMETRY_TYPES).await?;
+        if let Some(geometry) = &geometry {
+            check_geometry(&mut tx, "geometry", geometry, OBJECT_GEOMETRY_TYPES).await?;
+        }
         let refs = p.refs.map(|refs| json!(refs));
         let id: Option<i64> = sqlx::query_scalar(
             "WITH created AS (
@@ -332,21 +439,26 @@ impl House {
                  SELECT $2, $3, $4, $5, ST_GeomFromWKB($6, 0), $7, coalesce($8, '{}'), coalesce($9, '{}')
                  WHERE $1::bigint IS NULL RETURNING id
              ), updated AS (
-                 UPDATE object SET site_id = $2, floor_id = $3, kind = $4, name = $5, geom = ST_GeomFromWKB($6, 0),
-                                   height = $7, refs = coalesce($8, refs), attributes = coalesce($9, attributes)
+                 UPDATE object SET site_id = $2, floor_id = CASE WHEN $10 THEN $3 ELSE floor_id END,
+                                   kind = coalesce($4, kind), name = coalesce($5, name),
+                                   geom = coalesce(ST_GeomFromWKB($6, 0), geom),
+                                   height = CASE WHEN $11 THEN $7 ELSE height END,
+                                   refs = coalesce($8, refs), attributes = coalesce($9, attributes)
                  WHERE id = $1 AND deleted_at IS NULL RETURNING id
              )
              SELECT id FROM created UNION ALL SELECT id FROM updated",
         )
         .bind(p.id)
         .bind(p.site_id)
-        .bind(p.floor_id)
+        .bind(p.floor_id.flatten())
         .bind(&kind)
-        .bind(p.name.trim())
+        .bind(p.name.as_deref().map(str::trim))
         .bind(&geometry)
-        .bind(p.height)
+        .bind(p.height.flatten())
         .bind(refs)
         .bind(p.attributes.map(Value::Object))
+        .bind(p.floor_id.is_some())
+        .bind(p.height.is_some())
         .fetch_optional(&mut *tx)
         .await
         .map_err(error::db)?;
@@ -356,7 +468,7 @@ impl House {
     }
 
     #[tool(
-        description = "Add, change or remove some attributes of a space or object, leaving the rest as they are. `common_name` is the family's nickname for a space or object and is what render_plan labels it with, ahead of `name_en` and the stored `name`."
+        description = "Add, change or remove some attributes of a site, floor, space or object (`kind`: site, floor, space or object), leaving the rest as they are. Site and floor attributes suit facts about the whole, such as which drawing a floor came from; list_sites and get_floor return them. `common_name` is the family's nickname for a space or object and is what render_plan labels it with, ahead of `name_en` and the stored `name`. Example: {\"kind\": \"floor\", \"id\": 2, \"set\": {\"source_drawing\": \"plan sheet 2\"}, \"reason\": \"where the floor came from\"}."
     )]
     async fn set_attributes(
         &self,
@@ -369,6 +481,12 @@ impl House {
             return Err(error::invalid("set", "nothing to set or remove"));
         }
         let sql = match p.kind {
+            AttributeKind::Site => {
+                "UPDATE site SET attributes = (attributes || $2) - $3::text[] WHERE id = $1 AND deleted_at IS NULL RETURNING attributes"
+            }
+            AttributeKind::Floor => {
+                "UPDATE floor SET attributes = (attributes || $2) - $3::text[] WHERE id = $1 AND deleted_at IS NULL RETURNING attributes"
+            }
             AttributeKind::Space => {
                 "UPDATE space SET attributes = (attributes || $2) - $3::text[] WHERE id = $1 AND deleted_at IS NULL RETURNING attributes"
             }
@@ -673,6 +791,18 @@ fn guess_media_type(name: &str) -> &'static str {
         Some("md") => "text/markdown",
         Some("csv") => "text/csv",
         _ => "application/octet-stream",
+    }
+}
+
+/// Refuses a create that leaves out a field only an update may leave out,
+/// naming the first one missing.
+fn required_on_create<const N: usize>(what: &str, fields: [(&str, bool); N]) -> Result<(), ErrorData> {
+    match fields.into_iter().find(|(_, given)| !given) {
+        Some((field, _)) => Err(error::invalid(
+            field,
+            format!("is required to create a {what}; to change an existing {what}, give its id"),
+        )),
+        None => Ok(()),
     }
 }
 

@@ -9,13 +9,13 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{Row, postgres::PgRow};
 
 use super::House;
 use crate::{
     error,
-    render::{self, Extent, Feature, Label, MAX_SIDE_PX, MIN_SIDE_PX, Plan, Style},
+    render::{self, Extent, Feature, Label, LabelSize, MAX_SIDE_PX, MIN_SIDE_PX, Plan, Style, Symbol},
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -35,6 +35,14 @@ pub struct RenderPlanParams {
     /// is a non-empty string wins, otherwise the row's `name`. Omitted means
     /// `["common_name", "name_en"]`. An empty list means always `name`.
     pub label_from: Option<Vec<String>>,
+    /// `small`, `normal` (the default) or `large`: the label font, scaled
+    /// for a phone or for print.
+    #[serde(default)]
+    pub label_size: LabelSize,
+    /// Also return the SVG the PNG was drawn from. Default false: it is
+    /// large, and the PNG is what to look at.
+    #[serde(default)]
+    pub include_svg: bool,
 }
 
 /// The label keys when `label_from` is omitted.
@@ -50,7 +58,7 @@ struct Opening {
     from: (f64, f64),
     to: (f64, f64),
     wall_depth: f64,
-    arch: bool,
+    symbol: Symbol,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,7 +101,7 @@ pub enum Highlight {
 #[tool_router(router = plan_router, vis = "pub(super)")]
 impl House {
     #[tool(
-        description = "Draw a floor, or the site's outdoor areas, as a plan with a scale bar and north arrow. Returns a PNG to look at and the SVG it was drawn from. Each space and object is labelled from the first attribute named in `label_from` that holds a non-empty string, by default `common_name` (the family's nickname) and then `name_en`, with a leading \"the \" dropped and the first letter capitalized; without one it uses the row's `name` as stored. Pass `label_from: []` to label everything by `name`. Objects of kind `opening` cut a gap through the floor's walls at render time and are drawn as jamb ticks, with a dashed curve for an arch; the stored linework never changes."
+        description = "Draw a floor, or the site's outdoor areas with no `floor_id`, as a plan with a scale bar and north arrow. Returns a PNG to look at and a short JSON summary (size in pixels, and the legend); the SVG the PNG was drawn from comes too only with `include_svg: true`. Each space and object is labelled from the first attribute named in `label_from` that holds a non-empty string, by default `common_name` (the family's nickname) and then `name_en`, with a leading \"the \" dropped and the first letter capitalized; without one it uses the row's `name` as stored. Pass `label_from: []` to label everything by `name`. Labels never overlap and are never cut short: highlighted features are placed first, then spaces from the largest, then objects; each label tries its anchor, then eight spots around it, then smaller type, and a label with no room at all becomes a small numbered marker by its feature with its text in a legend beside the scale bar. A space's label always covers part of its space. `label_size` is `small`, `normal` or `large`. Objects of kind `opening` cut a gap through the floor's walls at render time, with jamb ticks either side, and are drawn by `opening_type`: an `arch` as two dashed lines across the gap along the wall's faces, a `door` as its leaf square to the wall with the quarter circle of its swing, an `opening` as the gap alone. The stored linework never changes. Without `floor_id`, linework imported onto the site with no floor is drawn."
     )]
     async fn render_plan(&self, Parameters(p): Parameters<RenderPlanParams>) -> Result<CallToolResult, ErrorData> {
         let size = p.size.unwrap_or(1600);
@@ -127,10 +135,8 @@ impl House {
             None => Vec::new(),
         };
         let mut features = Vec::new();
-        if p.layers.linework
-            && let Some(floor_id) = p.floor_id
-        {
-            features.extend(self.linework_features(floor_id, &openings).await?);
+        if p.layers.linework {
+            features.extend(self.linework_features(p.site_id, p.floor_id, &openings).await?);
         }
         if p.layers.spaces {
             features.extend(self.space_features(&p, &highlight, &label_from).await?);
@@ -150,7 +156,7 @@ impl House {
                         from: o.from,
                         to: o.to,
                         wall_depth: o.wall_depth,
-                        arch: o.arch,
+                        symbol: o.symbol,
                     },
                     label: None,
                 }));
@@ -172,15 +178,27 @@ impl House {
             rotation: site.get("rotation"),
             extent,
             features,
+            label_size: p.label_size,
         };
         let rendered = tokio::task::spawn_blocking(move || render::render(&plan, size))
             .await
             .map_err(|e| error::internal("rendering a plan", e))?
             .map_err(|e| error::internal("rendering a plan", e))?;
-        Ok(CallToolResult::success(vec![
+        let summary = json!({
+            "width": rendered.width,
+            "height": rendered.height,
+            "legend": rendered.legend.iter().enumerate()
+                .map(|(i, text)| json!({ "marker": i + 1, "label": text }))
+                .collect::<Vec<_>>(),
+        });
+        let mut content = vec![
             ContentBlock::image(STANDARD.encode(&rendered.png), "image/png"),
-            ContentBlock::text(rendered.svg),
-        ]))
+            ContentBlock::text(summary.to_string()),
+        ];
+        if p.include_svg {
+            content.push(ContentBlock::text(rendered.svg));
+        }
+        Ok(CallToolResult::success(content))
     }
 }
 
@@ -223,27 +241,27 @@ impl House {
                 continue;
             }
             let attributes: Value = r.get("attributes");
-            let wall_depth = attributes
-                .get("wall_depth")
-                .and_then(Value::as_f64)
-                .filter(|d| d.is_finite() && *d > 0.0)
-                .unwrap_or(DEFAULT_WALL_DEPTH);
             openings.push(Opening {
                 id,
                 wkb: r.get("wkb"),
                 from: (x0, y0),
                 to: (x1, y1),
-                wall_depth,
-                arch: attributes.get("opening_type").and_then(Value::as_str) == Some("arch"),
+                wall_depth: wall_depth(&attributes),
+                symbol: symbol(&attributes),
             });
         }
         Ok(openings)
     }
 
-    /// The floor's linework, less a flat ended buffer of each opening, half
-    /// its wall depth to each side. Rows an opening misses are drawn as
-    /// stored, and nothing stored changes.
-    async fn linework_features(&self, floor_id: i64, openings: &[Opening]) -> Result<Vec<Feature>, ErrorData> {
+    /// The floor's linework, or the site's when there is no floor, less a
+    /// flat ended buffer of each opening, half its wall depth to each side.
+    /// Rows an opening misses are drawn as stored, and nothing stored changes.
+    async fn linework_features(
+        &self,
+        site_id: i64,
+        floor_id: Option<i64>,
+        openings: &[Opening],
+    ) -> Result<Vec<Feature>, ErrorData> {
         let ids: Vec<i64> = openings.iter().map(|o| o.id).collect();
         let depths: Vec<f64> = openings.iter().map(|o| o.wall_depth).collect();
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
@@ -253,13 +271,15 @@ impl House {
              ), drawn AS (
                  SELECT CASE WHEN ST_Intersects(l.geom, cut.area) THEN ST_Difference(l.geom, cut.area) ELSE l.geom END AS geom
                  FROM linework l CROSS JOIN cut
-                 WHERE l.floor_id = $1 AND l.deleted_at IS NULL AND l.text IS NULL
+                 WHERE l.deleted_at IS NULL AND l.text IS NULL
+                   AND CASE WHEN $1::bigint IS NULL THEN l.floor_id IS NULL AND l.site_id = $4 ELSE l.floor_id = $1 END
              )
              SELECT ST_AsBinary(geom) FROM drawn WHERE NOT ST_IsEmpty(geom)",
         )
         .bind(floor_id)
         .bind(&ids)
         .bind(&depths)
+        .bind(site_id)
         .fetch_all(&self.db)
         .await
         .map_err(error::db)?;
@@ -341,6 +361,42 @@ impl House {
         .await
         .map_err(error::db)?;
         Ok(Extent { xmin, ymin, xmax, ymax })
+    }
+}
+
+/// An opening's `wall_depth` attribute, or the default when it is missing or
+/// not a positive number.
+pub(super) fn wall_depth(attributes: &Value) -> f64 {
+    attributes
+        .get("wall_depth")
+        .and_then(Value::as_f64)
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(DEFAULT_WALL_DEPTH)
+}
+
+/// The `opening_type` attribute's value, `opening` when missing or unknown.
+pub(super) fn opening_type(attributes: &Value) -> &'static str {
+    match attributes.get("opening_type").and_then(Value::as_str) {
+        Some("arch") => "arch",
+        Some("door") => "door",
+        _ => "opening",
+    }
+}
+
+/// What an opening's attributes say to draw across it. A door's `hinge` is
+/// the `start` or `end` of its line, default `start`; `swing` is the `left`
+/// or `right` of the line's direction, default `left`; `leaves` is 1 or 2,
+/// default 1. Anything else takes the default.
+fn symbol(attributes: &Value) -> Symbol {
+    let text = |key| attributes.get(key).and_then(Value::as_str);
+    match opening_type(attributes) {
+        "arch" => Symbol::Arch,
+        "door" => Symbol::Door {
+            hinge_end: text("hinge") == Some("end"),
+            swing_right: text("swing") == Some("right"),
+            double: attributes.get("leaves").and_then(Value::as_i64) == Some(2),
+        },
+        _ => Symbol::Plain,
     }
 }
 

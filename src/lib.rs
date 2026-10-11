@@ -14,14 +14,22 @@ pub mod render;
 pub mod units;
 mod web;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use axum::{Router, middleware};
+use axum::{
+    Router,
+    extract::Request,
+    http::StatusCode,
+    middleware,
+    response::{IntoResponse, Response},
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
 };
+use tokio::task::JoinHandle;
+use tower::ServiceExt;
 
-use crate::{auth::Tokens, config::Config, files::FileStore};
+use crate::{auth::Tokens, config::Config, db::Retry, files::FileStore};
 
 /// Bytes in a mebibyte.
 pub(crate) const MIB: usize = 1024 * 1024;
@@ -30,9 +38,49 @@ pub(crate) const MIB: usize = 1024 * 1024;
 /// the call.
 const MAX_MCP_BODY: usize = 36 * MIB;
 
-/// Connects, migrates and builds every route.
+/// Connects once, migrates and builds every route.
 pub async fn app(config: &Config) -> Result<Router, String> {
-    let pool = db::connect(&config.database_url)
+    build(config, Retry::ONCE).await
+}
+
+/// Routes that answer at once, and the work of connecting behind them. Until
+/// the database is reached and migrated every request is answered 503
+/// Service Unavailable, `/healthz` included, so the pod reports not ready
+/// rather than exiting while the database starts. The handle finishes when
+/// the routes are live, or with the error once the database has stayed out
+/// of reach for as long as `retry` allows.
+pub fn start(config: Config, retry: Retry) -> (Router, JoinHandle<Result<(), String>>) {
+    let live: Arc<OnceLock<Router>> = Arc::default();
+    let ready = tokio::spawn({
+        let live = live.clone();
+        async move {
+            let router = build(&config, retry).await?;
+            let _ = live.set(router);
+            tracing::info!("ready");
+            Ok(())
+        }
+    });
+    let router = Router::new().fallback(move |request: Request| {
+        let live = live.clone();
+        async move {
+            match live.get() {
+                Some(router) => match router.clone().oneshot(request).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                },
+                None => starting(),
+            }
+        }
+    });
+    (router, ready)
+}
+
+fn starting() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "starting: waiting for the database").into_response()
+}
+
+async fn build(config: &Config, retry: Retry) -> Result<Router, String> {
+    let pool = db::connect_with_retry(&config.database_url, retry)
         .await
         .map_err(|e| format!("connecting to the database: {e}"))?;
     db::MIGRATOR

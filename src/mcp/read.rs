@@ -35,7 +35,8 @@ pub struct FindParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WhatIsAtParams {
     pub site_id: i64,
-    /// Without a floor, only outdoor spaces and objects are considered.
+    /// Search outdoor rows and this floor. Omit to search outdoor rows and
+    /// every floor of the site.
     pub floor_id: Option<i64>,
     pub x: f64,
     pub y: f64,
@@ -103,12 +104,14 @@ fn like_pattern(text: &str) -> String {
 
 #[tool_router(router = read_router, vis = "pub(super)")]
 impl House {
-    #[tool(description = "List live sites with their floors and whether each site is georeferenced.")]
+    #[tool(
+        description = "List live sites with their attributes, their floors (with each floor's attributes), and whether each site is georeferenced, with its origin in WGS 84 and its rotation."
+    )]
     async fn list_sites(&self) -> Result<CallToolResult, ErrorData> {
         let rows = sqlx::query(
-            "SELECT s.id, s.name, s.rotation, s.origin IS NOT NULL AS georeferenced,
+            "SELECT s.id, s.name, s.rotation, s.attributes, s.origin IS NOT NULL AS georeferenced,
                     ST_X(ST_Transform(s.origin, 4326)) AS lon, ST_Y(ST_Transform(s.origin, 4326)) AS lat,
-                    coalesce((SELECT jsonb_agg(jsonb_build_object('id', f.id, 'name', f.name, 'level', f.level) ORDER BY f.level)
+                    coalesce((SELECT jsonb_agg(jsonb_build_object('id', f.id, 'name', f.name, 'level', f.level, 'attributes', f.attributes) ORDER BY f.level)
                               FROM floor f WHERE f.site_id = s.id AND f.deleted_at IS NULL), '[]') AS floors
              FROM site s WHERE s.deleted_at IS NULL ORDER BY s.name",
         )
@@ -124,6 +127,7 @@ impl House {
                     "georeferenced": r.get::<bool, _>("georeferenced"),
                     "origin_wgs84": r.get::<Option<f64>, _>("lon").map(|lon| json!({"lon": lon, "lat": r.get::<Option<f64>, _>("lat")})),
                     "rotation": r.get::<f64, _>("rotation"),
+                    "attributes": r.get::<Value, _>("attributes"),
                     "floors": r.get::<Value, _>("floors"),
                 })
             })
@@ -131,10 +135,12 @@ impl House {
         json_result(sites)
     }
 
-    #[tool(description = "A floor with every live space and object on it, geometry as GeoJSON in the site frame.")]
+    #[tool(
+        description = "A floor with its attributes and every live space and object on it, geometry as GeoJSON in the site frame."
+    )]
     async fn get_floor(&self, Parameters(p): Parameters<FloorParams>) -> Result<CallToolResult, ErrorData> {
         let floor = sqlx::query(
-            "SELECT id, site_id, name, level, elevation, ceiling_height FROM floor WHERE id = $1 AND deleted_at IS NULL",
+            "SELECT id, site_id, name, level, elevation, ceiling_height, attributes FROM floor WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(p.floor_id)
         .fetch_optional(&self.db)
@@ -150,6 +156,7 @@ impl House {
             "level": floor.get::<i32, _>("level"),
             "elevation": floor.get::<f64, _>("elevation"),
             "ceiling_height": floor.get::<Option<f64>, _>("ceiling_height"),
+            "attributes": floor.get::<Value, _>("attributes"),
             "spaces": spaces,
             "objects": objects,
         }))
@@ -224,7 +231,7 @@ impl House {
     }
 
     #[tool(
-        description = "What is at a point: the spaces containing it, and the objects within a radius, nearest first."
+        description = "What is at a point: the spaces containing it, smallest first, and the objects within a radius (default 1 m), nearest first. With `floor_id`, outdoor rows and that floor are searched. Without it, outdoor rows and every floor of the site are searched, so a point inside the house finds the room under it on each floor. Every hit names its floor (`floor`: id, name and level), or null when it is outdoors."
     )]
     async fn what_is_at(&self, Parameters(p): Parameters<WhatIsAtParams>) -> Result<CallToolResult, ErrorData> {
         let radius = p.radius.unwrap_or(1.0);
@@ -232,11 +239,12 @@ impl House {
             return Err(error::invalid("radius", "must be between 0 and 1000 metres"));
         }
         let spaces = sqlx::query(
-            "SELECT id, floor_id, name, kind FROM space
-             WHERE site_id = $1 AND deleted_at IS NULL
-               AND (floor_id IS NULL OR floor_id = $2)
-               AND ST_Covers(geom, ST_MakePoint($3, $4))
-             ORDER BY ST_Area(geom)",
+            "SELECT s.id, s.floor_id, s.name, s.kind, f.name AS floor_name, f.level
+             FROM space s LEFT JOIN floor f ON f.id = s.floor_id
+             WHERE s.site_id = $1 AND s.deleted_at IS NULL
+               AND (s.floor_id IS NULL OR $2::bigint IS NULL AND f.deleted_at IS NULL OR s.floor_id = $2)
+               AND ST_Covers(s.geom, ST_MakePoint($3, $4))
+             ORDER BY f.level NULLS FIRST, ST_Area(s.geom), s.id",
         )
         .bind(p.site_id)
         .bind(p.floor_id)
@@ -246,11 +254,13 @@ impl House {
         .await
         .map_err(error::db)?;
         let objects = sqlx::query(
-            "SELECT id, floor_id, name, kind, ST_Distance(geom, ST_MakePoint($3, $4)) AS distance FROM object
-             WHERE site_id = $1 AND deleted_at IS NULL
-               AND (floor_id IS NULL OR floor_id = $2)
-               AND ST_DWithin(geom, ST_MakePoint($3, $4), $5)
-             ORDER BY distance, id",
+            "SELECT o.id, o.floor_id, o.name, o.kind, f.name AS floor_name, f.level,
+                    ST_Distance(o.geom, ST_MakePoint($3, $4)) AS distance
+             FROM object o LEFT JOIN floor f ON f.id = o.floor_id
+             WHERE o.site_id = $1 AND o.deleted_at IS NULL
+               AND (o.floor_id IS NULL OR $2::bigint IS NULL AND f.deleted_at IS NULL OR o.floor_id = $2)
+               AND ST_DWithin(o.geom, ST_MakePoint($3, $4), $5)
+             ORDER BY distance, o.id",
         )
         .bind(p.site_id)
         .bind(p.floor_id)
@@ -260,16 +270,24 @@ impl House {
         .fetch_all(&self.db)
         .await
         .map_err(error::db)?;
+        let floor = |r: &sqlx::postgres::PgRow| {
+            r.get::<Option<i64>, _>("floor_id").map(|id| {
+                json!({ "id": id, "name": r.get::<Option<String>, _>("floor_name"), "level": r.get::<Option<i32>, _>("level") })
+            })
+        };
         json_result(json!({
+            "searched": if p.floor_id.is_some() { "outdoors and the given floor" } else { "outdoors and every floor" },
             "spaces": spaces.iter().map(|r| json!({
                 "id": r.get::<i64, _>("id"),
                 "floor_id": r.get::<Option<i64>, _>("floor_id"),
+                "floor": floor(r),
                 "name": r.get::<String, _>("name"),
                 "kind": r.get::<String, _>("kind"),
             })).collect::<Vec<_>>(),
             "objects": objects.iter().map(|r| json!({
                 "id": r.get::<i64, _>("id"),
                 "floor_id": r.get::<Option<i64>, _>("floor_id"),
+                "floor": floor(r),
                 "name": r.get::<String, _>("name"),
                 "kind": r.get::<String, _>("kind"),
                 "distance": r.get::<Option<f64>, _>("distance"),

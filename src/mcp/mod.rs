@@ -1,10 +1,11 @@
 //! The MCP tools.
 //!
-//! Read tools are in `read`, write tools in `write`, the two importers in
-//! `import` and the plan renderer in `plan`. A write tool is one in the write
+//! Read tools are in `read` and `connections`, write tools in `write`, the
+//! two importers in `import` and the plan renderer in `plan`. A write tool is one in the write
 //! router; the handler refuses those to a read only caller before they run,
 //! and hides them from that caller's tool list.
 
+mod connections;
 mod import;
 mod plan;
 mod read;
@@ -49,7 +50,7 @@ impl House {
         Self {
             db,
             files,
-            read_tools: Arc::new(Self::read_router() + Self::plan_router()),
+            read_tools: Arc::new(Self::read_router() + Self::plan_router() + Self::connections_router()),
             write_tools: Arc::new(Self::write_router() + Self::import_router()),
         }
     }
@@ -117,8 +118,8 @@ impl ServerHandler for House {
 
 const INSTRUCTIONS: &str = "A model of a house and its grounds. Each site has its own frame: metres, x east, y north, \
 with an origin chosen when the site was made. Every coordinate a tool takes or returns is in that frame unless a \
-tool says otherwise. Ask spatial questions with what_is_at, in_space, nearest and measure rather than working them \
-out from coordinates. Every write needs a reason, which is kept with the change.";
+tool says otherwise. Ask spatial questions with what_is_at, in_space, nearest, measure and connections rather than \
+working them out from coordinates. Every write needs a reason, which is kept with the change.";
 
 /// The kinds of thing that can be deleted, restored or have a history.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]

@@ -10,12 +10,12 @@ Each site has its own frame: metres, x east, y north, z up, with an origin chose
 
 | Table | Holds |
 | --- | --- |
-| `site` | name, optional origin and rotation |
-| `floor` | site, name, level, elevation, ceiling height |
+| `site` | name, optional origin and rotation, attributes |
+| `floor` | site, name, level, elevation, ceiling height, attributes |
 | `space` | site, floor (null outdoors), name, kind (`room`, `terrace`, `garden_bed`, `pool`, `parcel`, `building`), polygon, wall material, attributes |
-| `object` | site, floor (null outdoors), kind (`light`, `switch`, `socket`, `access_point`, `camera`, `sensor`, `speaker`, `tree`, `pipe`, `cable_run` or any other lowercase word), name, point, line or polygon, height above the floor, outside identifiers in `refs`, attributes |
-| `linework` | CAD geometry as drawn, by import and layer, for rendering |
-| `dxf_import` | one row per import of a drawing onto a floor |
+| `object` | site, floor (null outdoors), kind (`light`, `switch`, `socket`, `access_point`, `camera`, `sensor`, `speaker`, `tree`, `pipe`, `cable_run`, `opening` or any other lowercase word), name, point, line or polygon, height above the floor, outside identifiers in `refs`, attributes |
+| `linework` | CAD geometry as drawn, by import and layer, for rendering; on a floor, or on the site with no floor |
+| `dxf_import` | one row per import of a drawing onto a floor, or onto a site with no floor |
 | `file` | name, media type, size, sha256, optional links to a site, floor, space or object |
 | `note` | markdown text with a source line, linked like a file |
 | `change` | every insert, update and delete on the tables above |
@@ -38,44 +38,69 @@ The migrations grant to `house_qgis` and `house_ro` but do not create them, beca
 
 ## Tools
 
+Every tool's description in `tools/list` says what it does, what it takes and what it returns, with an example where the arguments are not obvious. The tables below are a map.
+
 Read tools, available to both tokens:
 
 | Tool | Does |
 | --- | --- |
-| `list_sites` | live sites with their floors and georeference |
-| `get_floor` | a floor with its spaces and objects as GeoJSON |
+| `list_sites` | live sites with their attributes, floors (with theirs) and georeference |
+| `get_floor` | a floor with its attributes, spaces and objects as GeoJSON |
 | `find` | spaces and objects by part of a name, kind, outside identifier or attribute |
-| `what_is_at` | the spaces containing a point, and the objects within a radius |
+| `what_is_at` | the spaces containing a point, and the objects within a radius; with `floor_id`, outdoors and that floor, without it outdoors and every floor, each hit naming its floor |
 | `in_space` | the objects and smaller spaces inside a space |
 | `nearest` | the n objects of a kind nearest a point, space or object, in plan |
 | `measure` | area, perimeter and length, and the distance between two things |
+| `connections` | the openings that touch a space and the space beyond each, or the shortest way between two spaces through openings |
 | `list_files` | files, optionally by what they are linked to |
 | `get_file` | a file's metadata, with its content when it is UTF-8 text of at most 1 MiB |
 | `search_notes` | notes containing some text |
 | `history` | the `change` rows for one thing |
-| `render_plan` | a floor or the site's outdoor areas as a PNG and the SVG it was drawn from, with a scale bar and north arrow |
+| `render_plan` | a floor or the site's outdoor areas as a PNG with a scale bar and north arrow, and a short JSON summary; the SVG too with `include_svg: true` |
 
 Write tools take a required `reason`. They are refused to the read only token and left out of its tool list.
 
 | Tool | Does |
 | --- | --- |
 | `create_site` | a site, optionally with an origin in any EPSG system and a rotation |
-| `upsert_floor`, `upsert_space`, `upsert_object` | create a row, or replace the fields of an existing one |
-| `set_attributes` | add, change or remove some attributes of a space or object |
+| `set_site_origin` | set or replace a site's origin, in any EPSG system, and optionally its rotation |
+| `upsert_floor` | create a floor, or replace an existing floor's fields |
+| `upsert_space`, `upsert_object` | create a row, or update one by `id`, keeping every field left out |
+| `set_attributes` | add, change or remove some attributes of a site, floor, space or object |
 | `link_ref` | set or remove one outside identifier on an object, such as `ha_entity_id` |
 | `add_note` | a markdown note with its source |
 | `upload_file` | text inline, or binary as base64 up to 25 MiB |
 | `import_geojson` | features in any EPSG system as spaces or objects, converted into the site frame |
-| `import_dxf` | a stored DXF drawing onto a floor |
+| `import_dxf` | a stored DXF drawing onto a floor, or onto the site with no floor |
 | `delete`, `restore` | mark a row deleted, or bring it back |
+
+### Updating part of a row
+
+`upsert_space` and `upsert_object` need `name`, `kind` and `geometry` to create a row, and an error names the first one missing. With `id`, every field but `site_id` and `reason` may be left out and keeps its stored value, so a rename does not resend the geometry:
+
+```json
+{"id": 41, "site_id": 1, "name": "Reading lamp", "reason": "what we call it"}
+```
+
+Sending `floor_id`, `height` or `wall_material` as `null` clears it; leaving it out keeps it. `attributes` and `refs`, when given, replace them all; `set_attributes` and `link_ref` change some.
+
+### Georeference
+
+`create_site` may set the origin, and `set_site_origin` sets or replaces it later, with the rotation when given. Stored geometry is in the site frame and does not move; the origin says where that frame lies on the earth, which `import_geojson` uses to convert. The change is recorded with its reason like any other write.
+
+```json
+{"site_id": 3, "origin": {"epsg": 4326, "x": 9.19, "y": 45.46}, "rotation": 12.5, "reason": "origin at the south west corner of the survey"}
+```
 
 ### DXF import
 
 `import_dxf` reads LINE, LWPOLYLINE, POLYLINE, ARC, CIRCLE, INSERT (blocks expanded), TEXT and MTEXT from model space. Every entity read is kept as linework. A layer mapping such as `{"A-ROOM": {"space": "room"}, "E-LIGHT": {"object": "light"}}` turns closed polylines on a space layer into spaces, each named by the tallest text that PostGIS finds inside it, and block insertions on an object layer into objects at their insertion points. Layer names match in any case.
 
+With `floor_id` the drawing goes onto that floor. With `site_id` and no `floor_id` it goes onto the site itself, as for a drawing of the grounds: its linework is drawn by `render_plan` on the site's outdoor plan, and the spaces and objects it makes are outdoor ones.
+
 Units come from the drawing's `$INSUNITS` header. A drawing with no unit there is refused unless the call gives `unit`, which also overrides the header when both are present. An optional `transform` scales, rotates (degrees counterclockwise) and offsets the drawing after the unit conversion. The result reports counts per layer, the spaces and objects made, outlines PostGIS found invalid, and every entity skipped with the reason.
 
-Importing the same file content onto the same floor again marks the earlier import and everything it made as deleted, then imports afresh. A DWG file can be stored but not imported; convert it to DXF with the free ODA File Converter first.
+Importing the same file content onto the same floor, or onto the same site with no floor, again marks the earlier import and everything it made as deleted, then imports afresh. A DWG file can be stored but not imported; convert it to DXF with the free ODA File Converter first.
 
 ### Plan labels
 
@@ -91,22 +116,53 @@ Nicknames are ordinary attributes, so `set_attributes` changes a label on the ne
 {"kind": "space", "id": 7, "set": {"common_name": "the snug"}, "reason": "what we call it"}
 ```
 
+Labels are placed after the whole plan is laid out, so that none overlaps another, none covers an object's symbol or the north arrow, and none is cut short. Highlighted features go first, then spaces from the largest to the smallest, then objects. Each label tries its anchor (the middle of a space, just right of an object), then eight spots one text height around it, then the same at 80% and 65% of its size, and takes the first that is clear and inside the image; a space's label must still cover part of the space. A label with nowhere to go becomes a small numbered marker by its feature, with a leader line if it had to move, and its text is listed against the number in a legend in the footer beside the scale bar. The summary `render_plan` returns lists the legend. A legend too long for the image makes the image taller rather than lose an entry.
+
+`label_size` is `small`, `normal` (the default) or `large`: 0.8, 1 and 1.35 times the usual type, for a phone or for print.
+
 ### Openings
 
-An object of kind `opening` is an arch or open doorway. Its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. When `render_plan` draws that floor it removes the floor's linework within a flat ended buffer of the line, half of `wall_depth` to each side, and draws a jamb tick across the wall at each end; an arch also gets a dashed half ellipse across the gap. The stored linework is never changed, so moving or deleting the opening shows on the next render.
+An object of kind `opening` is a door, arch or open doorway. Its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. When `render_plan` draws that floor it removes the floor's linework within a flat ended buffer of the line, half of `wall_depth` to each side, and draws a jamb tick across the wall at each end, then the opening's symbol:
+
+- an `arch` gets two dashed lines straight across the gap, one along each face of the wall, as a plan shows an opening with structure overhead;
+- a `door` gets its leaf, a solid line square to the wall from the hinge jamb, and its swing, a thin quarter circle from the leaf's tip back to the other jamb; a pair of doors gets a half leaf and swing from each jamb;
+- an `opening` gets the gap alone.
+
+The stored linework is never changed, so moving or deleting the opening shows on the next render.
 
 | Attribute | Value | Default |
 | --- | --- | --- |
-| `opening_type` | `arch` or `opening` | `opening` |
+| `opening_type` | `door`, `arch` or `opening` | `opening` |
 | `wall_depth` | the wall's thickness in metres, a positive number | 0.6 |
+| `hinge` | for a door, the `start` or `end` of the line the leaf hangs from | `start` |
+| `swing` | for a door, the `left` or `right` of the line's direction it opens towards | `left` |
+| `leaves` | for a door, 1 or 2 | 1 |
+| `connects` | the two space ids the opening joins | found from the geometry |
 
 Any other geometry, or a LineString of more than two points, is drawn as an ordinary object and logged as a warning.
 
 ```json
-{"site_id": 1, "floor_id": 2, "kind": "opening", "name": "Arch to the hall",
- "geometry": {"type": "LineString", "coordinates": [[4.0, 1.2], [4.0, 2.8]]},
+{"site_id": 1, "floor_id": 2, "kind": "opening", "name": "Door to the hall",
+ "geometry": {"type": "LineString", "coordinates": [[4.0, 1.2], [4.0, 2.1]]},
+ "attributes": {"opening_type": "door", "hinge": "end", "swing": "right", "wall_depth": 0.3}, "reason": "door on the survey"}
+```
+
+```json
+{"site_id": 1, "floor_id": 2, "kind": "opening", "name": "Arch to the kitchen",
+ "geometry": {"type": "LineString", "coordinates": [[7.0, 0.5], [7.0, 2.1]]},
  "attributes": {"opening_type": "arch", "wall_depth": 0.45}, "reason": "arch on the survey"}
 ```
+
+### Connections
+
+`connections` answers how the spaces join. An opening joins the two spaces its `connects` attribute lists. Without that, it joins the spaces either side of it on its floor that reach within `wall_depth` of its midpoint, the smallest on each side, never a building or parcel outline. A `connects` that does not name two different live spaces of the site is reported in `warnings` and the geometry is used instead.
+
+```json
+{"space_id": 12}
+{"from_space": 12, "to_space": 15}
+```
+
+The first lists every opening touching the space with its `opening_type` and the space on the other side, or null where nothing recorded is there, such as outdoors. The second returns the way passing the fewest openings, as an alternating list of spaces and openings; when there is none through recorded openings, `path` is null and `message` says so.
 
 ### Limits
 
@@ -127,7 +183,7 @@ Any other geometry, or a LineString of more than two points, is drawn as an ordi
 
 | Route | Auth | Does |
 | --- | --- | --- |
-| `GET /healthz` | none | 200 when the database answers |
+| `GET /healthz` | none | 200 when the database answers; 503 while it does not, and while the server is still connecting at start |
 | `POST /mcp` | bearer | MCP over streamable HTTP, stateless |
 | `POST /api/files?name=...` | bearer, read and write | stores the request body; `Content-Type` is the media type; optional `reason`, `site_id`, `floor_id`, `space_id`, `object_id` |
 | `GET /api/files/<sha256>` | bearer | the file, as an attachment |
@@ -135,6 +191,10 @@ Any other geometry, or a LineString of more than two points, is drawn as an ordi
 | `GET /files/<sha256>` | basic, as above | the file, as an attachment |
 
 Files are stored on the volume under their sha256 and are only ever addressed by it. Downloads are served as `application/octet-stream` attachments with `nosniff`. The page escapes every name, sends a strict Content Security Policy and refuses a form post whose `Origin` is not its own.
+
+### Starting
+
+The server listens at once and connects to the database behind the listener, trying again with a wait that doubles from 1 second up to 30, for up to 5 minutes, and logging each attempt at info. Until it has connected and run the migrations, every request, `/healthz` included, is answered 503, so a database that starts after the server leaves the pod not ready rather than restarting it. Only a database still out of reach after 5 minutes makes the process exit.
 
 ## Configuration
 

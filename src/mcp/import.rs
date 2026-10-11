@@ -61,7 +61,12 @@ pub struct ImportGeoJsonParams {
 pub struct ImportDxfParams {
     /// The sha256 of a stored DXF file.
     pub file_sha256: String,
-    pub floor_id: i64,
+    /// The floor to import onto. Omit, and give `site_id`, to import a
+    /// drawing of the grounds onto the site itself.
+    pub floor_id: Option<i64>,
+    /// Needed without `floor_id`. With it, it may be left out, and if given
+    /// must be the floor's site.
+    pub site_id: Option<i64>,
     /// DXF layer name (any case) to what its entities become beyond linework,
     /// such as `{"ROOMS": {"space": "room"}, "LIGHTS": {"object": "light"}}`.
     #[serde(default)]
@@ -112,7 +117,7 @@ impl House {
     }
 
     #[tool(
-        description = "Import a stored DXF drawing onto a floor. Every entity is kept as linework; closed polylines on a layer mapped to a space kind become spaces named by the text inside them, and block insertions on a layer mapped to an object kind become objects. A second import of the same file onto the same floor replaces the first. DWG is not read."
+        description = "Import a stored DXF drawing onto a floor, or with `site_id` and no `floor_id` onto the site itself, as for a drawing of the grounds. Every entity is kept as linework, which render_plan draws on that floor, or on the site's outdoor plan (no `floor_id`) for a site import. Closed polylines on a layer mapped to a space kind become spaces named by the text inside them, and block insertions on a layer mapped to an object kind become objects; a site import makes them outdoor ones. A second import of the same file onto the same floor, or onto the same site with no floor, replaces the first. DWG is not read."
     )]
     async fn import_dxf(
         &self,
@@ -154,13 +159,8 @@ impl House {
             .map_err(|e| error::invalid("file_sha256", e))?;
 
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
-        let site_id: i64 = sqlx::query_scalar("SELECT site_id FROM floor WHERE id = $1 AND deleted_at IS NULL")
-            .bind(p.floor_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(error::db)?
-            .ok_or_else(|| error::invalid("floor_id", "no live floor with this id"))?;
-        let replaced = retire_previous_import(&mut tx, file.sha.as_str(), p.floor_id).await?;
+        let site_id = import_site(&mut tx, p.floor_id, p.site_id).await?;
+        let replaced = retire_previous_import(&mut tx, file.sha.as_str(), site_id, p.floor_id).await?;
         let summary = json!({
             "unit": parsed.unit,
             "unit_from": if parsed.unit_from_call { "call" } else { "$INSUNITS" },
@@ -169,19 +169,20 @@ impl House {
         });
         let options = json!({ "layers": layers, "unit": p.unit, "transform": p.transform });
         let import_id: i64 = sqlx::query_scalar(
-            "INSERT INTO dxf_import (file_id, sha256, floor_id, unit, options, summary)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            "INSERT INTO dxf_import (file_id, sha256, floor_id, site_id, unit, options, summary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
         )
         .bind(file.id)
         .bind(file.sha.as_str())
         .bind(p.floor_id)
+        .bind(site_id)
         .bind(parsed.unit.name())
         .bind(&options)
         .bind(&summary)
         .fetch_one(&mut *tx)
         .await
         .map_err(error::db)?;
-        insert_linework(&mut tx, import_id, p.floor_id, &parsed).await?;
+        insert_linework(&mut tx, import_id, site_id, p.floor_id, &parsed).await?;
         let (spaces, invalid) = insert_spaces(&mut tx, import_id, site_id, p.floor_id, &parsed).await?;
         let objects = insert_objects(&mut tx, import_id, site_id, p.floor_id, &parsed).await?;
         tx.commit().await.map_err(error::db)?;
@@ -310,14 +311,55 @@ async fn insert_feature(
         .map_err(error::db)
 }
 
-/// Marks an earlier import of the same content onto the same floor as
-/// deleted, with everything it created, and returns its id.
-async fn retire_previous_import(tx: &mut PgConnection, sha256: &str, floor_id: i64) -> Result<Option<i64>, ErrorData> {
+/// The site an import goes onto: the floor's when there is a floor, which
+/// `site_id` must then agree with, or else `site_id`.
+async fn import_site(tx: &mut PgConnection, floor_id: Option<i64>, site_id: Option<i64>) -> Result<i64, ErrorData> {
+    match (floor_id, site_id) {
+        (Some(floor_id), site_id) => {
+            let floor_site: i64 = sqlx::query_scalar("SELECT site_id FROM floor WHERE id = $1 AND deleted_at IS NULL")
+                .bind(floor_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(error::db)?
+                .ok_or_else(|| error::invalid("floor_id", "no live floor with this id"))?;
+            if site_id.is_some_and(|site| site != floor_site) {
+                return Err(error::invalid("site_id", "is not the floor's site"));
+            }
+            Ok(floor_site)
+        }
+        (None, Some(site_id)) => {
+            let live: Option<i64> = sqlx::query_scalar("SELECT id FROM site WHERE id = $1 AND deleted_at IS NULL")
+                .bind(site_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(error::db)?;
+            live.ok_or_else(|| error::invalid("site_id", "no live site with this id"))
+        }
+        (None, None) => Err(error::invalid(
+            "floor_id",
+            "give floor_id to import onto a floor, or site_id alone to import onto the site",
+        )),
+    }
+}
+
+/// Marks an earlier import of the same content onto the same floor, or onto
+/// the same site with no floor, as deleted, with everything it created, and
+/// returns its id.
+async fn retire_previous_import(
+    tx: &mut PgConnection,
+    sha256: &str,
+    site_id: i64,
+    floor_id: Option<i64>,
+) -> Result<Option<i64>, ErrorData> {
     let previous: Option<i64> = sqlx::query_scalar(
-        "UPDATE dxf_import SET deleted_at = now() WHERE sha256 = $1 AND floor_id = $2 AND deleted_at IS NULL RETURNING id",
+        "UPDATE dxf_import SET deleted_at = now()
+         WHERE sha256 = $1 AND deleted_at IS NULL
+           AND CASE WHEN $2::bigint IS NULL THEN floor_id IS NULL AND site_id = $3 ELSE floor_id = $2 END
+         RETURNING id",
     )
     .bind(sha256)
     .bind(floor_id)
+    .bind(site_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(error::db)?;
@@ -336,7 +378,8 @@ async fn retire_previous_import(tx: &mut PgConnection, sha256: &str, floor_id: i
 async fn insert_linework(
     tx: &mut PgConnection,
     import_id: i64,
-    floor_id: i64,
+    site_id: i64,
+    floor_id: Option<i64>,
     parsed: &Parsed,
 ) -> Result<(), ErrorData> {
     let mut layers = Vec::new();
@@ -352,8 +395,8 @@ async fn insert_linework(
         heights.push(item.text_height);
     }
     sqlx::query(
-        "INSERT INTO linework (dxf_import_id, floor_id, layer, entity, geom, text, text_height)
-         SELECT $1, $2, u.layer, u.entity, ST_GeomFromWKB(u.wkb, 0), u.text, u.height
+        "INSERT INTO linework (dxf_import_id, floor_id, site_id, layer, entity, geom, text, text_height)
+         SELECT $1, $2, $8, u.layer, u.entity, ST_GeomFromWKB(u.wkb, 0), u.text, u.height
          FROM unnest($3::text[], $4::text[], $5::bytea[], $6::text[], $7::float8[]) AS u(layer, entity, wkb, text, height)",
     )
     .bind(import_id)
@@ -363,6 +406,7 @@ async fn insert_linework(
     .bind(&geometries)
     .bind(&texts)
     .bind(&heights)
+    .bind(site_id)
     .execute(&mut *tx)
     .await
     .map_err(error::db)?;
@@ -377,7 +421,7 @@ async fn insert_spaces(
     tx: &mut PgConnection,
     import_id: i64,
     site_id: i64,
-    floor_id: i64,
+    floor_id: Option<i64>,
     parsed: &Parsed,
 ) -> Result<(Vec<Value>, Vec<Value>), ErrorData> {
     let mut geometries = Vec::new();
@@ -439,7 +483,7 @@ async fn insert_objects(
     tx: &mut PgConnection,
     import_id: i64,
     site_id: i64,
-    floor_id: i64,
+    floor_id: Option<i64>,
     parsed: &Parsed,
 ) -> Result<Vec<Value>, ErrorData> {
     let mut geometries = Vec::new();

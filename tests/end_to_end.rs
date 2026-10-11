@@ -80,6 +80,16 @@ async fn ok(client: &RunningService<RoleClient, ()>, tool: &'static str, args: V
     serde_json::from_str(&text.text).unwrap_or_else(|_| Value::String(text.text.clone()))
 }
 
+/// The SVG among a plan's text blocks, if it has one.
+fn svg_of(result: &CallToolResult) -> Option<String> {
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .find(|t| t.text.starts_with("<svg"))
+        .map(|t| t.text.clone())
+}
+
 /// One field of every item in a list, in order.
 fn column(list: &Value, key: &str) -> Vec<Value> {
     list.as_array()
@@ -120,10 +130,11 @@ async fn end_to_end() {
         .into_iter()
         .map(|t| t.name.into())
         .collect();
-    assert_eq!(rw_tools.len(), 24, "{rw_tools:?}");
+    assert_eq!(rw_tools.len(), 26, "{rw_tools:?}");
     assert_eq!(
         ro_tools,
         [
+            "connections",
             "find",
             "get_file",
             "get_floor",
@@ -230,7 +241,8 @@ async fn end_to_end() {
     let inside = ok(&ro, "in_space", json!({"space_id": kitchen})).await;
     assert_eq!(inside["objects"][0]["id"], light);
 
-    // render_plan returns a PNG at the default size and the SVG with both room names.
+    // render_plan returns a PNG at the default size and a short summary, and
+    // the SVG with both room names only when asked.
     let plan = call(
         &ro,
         "render_plan",
@@ -243,8 +255,21 @@ async fn end_to_end() {
     let png = STANDARD.decode(&image.data).expect("base64");
     let pixmap = Pixmap::decode_png(&png).expect("a PNG");
     assert_eq!(pixmap.width(), 1600);
-    let svg = &plan.content.iter().find_map(|c| c.as_text()).expect("svg").text;
-    assert!(svg.starts_with("<svg") && svg.contains(">Kitchen</text>") && svg.contains(">Living room</text>"));
+    assert!(svg_of(&plan).is_none(), "no SVG unless asked");
+    let summary = plan.content.iter().find_map(|c| c.as_text()).expect("summary");
+    let summary: Value = serde_json::from_str(&summary.text).expect("JSON");
+    assert_eq!(summary["width"], 1600);
+    assert_eq!(summary["legend"], json!([]));
+    let plan = call(
+        &ro,
+        "render_plan",
+        json!({"site_id": site, "floor_id": floor, "include_svg": true}),
+    )
+    .await
+    .expect("render_plan");
+    assert_eq!(plan.content.iter().filter(|c| c.as_image().is_some()).count(), 1);
+    let svg = svg_of(&plan).expect("SVG when asked");
+    assert!(svg.contains(">Kitchen</text>") && svg.contains(">Living room</text>"));
 
     // A parcel from the land registry in longitude and latitude, about 30 by
     // 45 metres around the site origin.
@@ -1251,12 +1276,12 @@ async fn plan_labels_come_from_nicknames_then_english_names_then_names() {
         .await;
     }
     let labels = async |extra: Value| {
-        let mut args = json!({"site_id": site, "floor_id": floor});
+        let mut args = json!({"site_id": site, "floor_id": floor, "include_svg": true});
         args.as_object_mut()
             .expect("an object")
             .extend(extra.as_object().expect("an object").clone());
         let plan = call(&rw, "render_plan", args).await.expect("render_plan");
-        let svg = plan.content.iter().find_map(|c| c.as_text()).expect("svg").text.clone();
+        let svg = svg_of(&plan).expect("svg");
         let mut found: Vec<String> = svg
             .split("</text>")
             .filter_map(|s| s.rsplit_once('>').map(|(_, text)| text.to_owned()))
@@ -1329,13 +1354,14 @@ struct Drawn {
     svg: String,
 }
 
-async fn draw(client: &RunningService<RoleClient, ()>, args: Value) -> Drawn {
+async fn draw(client: &RunningService<RoleClient, ()>, mut args: Value) -> Drawn {
+    args["include_svg"] = json!(true);
     let plan = call(client, "render_plan", args).await.expect("render_plan");
     let image = plan.content.iter().find_map(|c| c.as_image()).expect("image content");
     let png = STANDARD.decode(&image.data).expect("base64");
     Drawn {
         pixmap: Pixmap::decode_png(&png).expect("a PNG"),
-        svg: plan.content.iter().find_map(|c| c.as_text()).expect("svg").text.clone(),
+        svg: svg_of(&plan).expect("svg"),
     }
 }
 
@@ -1393,8 +1419,8 @@ async fn openings_cut_the_walls_they_cross_and_draw_their_symbol() {
             "wall at y = {y} m is kept right of the arch"
         );
     }
-    // Nothing is opened or drawn outside the arch: its width, its jambs
-    // 0.3 m either side of the wall, and its curve 0.4 m to the left. A wall
+    // Nothing is opened or drawn outside the arch: its width, and its jambs
+    // and faces 0.3 m either side of the wall. A wall
     // drawn in two pieces may shade its edge pixels a little differently, so
     // outside the arch a pixel may change but not go blank or gain ink.
     let (left, top) = walled_px(2.0, 1.9);
@@ -1413,15 +1439,20 @@ async fn openings_cut_the_walls_they_cross_and_draw_their_symbol() {
         with_arch.svg.contains("L533.33 410.00 M928.00 410.00"),
         "centre line cut at x = 2 and 3.6 m"
     );
-    assert_eq!(with_arch.svg.matches("<line ").count(), 2, "two jamb ticks");
-    assert_eq!(with_arch.svg.matches("stroke-dasharray").count(), 1, "one dashed curve");
+    assert_eq!(
+        with_arch.svg.matches("<line ").count(),
+        4,
+        "two jamb ticks and two faces"
+    );
+    assert_eq!(with_arch.svg.matches("stroke-dasharray").count(), 2, "two dashed faces");
+    assert!(!with_arch.svg.contains("<path class"), "no curve");
     assert!(!with_arch.svg.contains(">Arch</text>"), "openings have no label");
     let highlighted = draw(
         &rw,
         json!({"site_id": site, "floor_id": floor, "highlight": [{"object": arch}]}),
     )
     .await;
-    assert_eq!(highlighted.svg.matches(r##"stroke="#e8590c""##).count(), 3);
+    assert_eq!(highlighted.svg.matches(r##"stroke="#e8590c""##).count(), 4);
 
     // A plain opening has its ticks and no curve.
     let set = async |attributes: Value| {
@@ -1488,4 +1519,635 @@ fn changed_pixels(a: &Pixmap, b: &Pixmap) -> Vec<(u32, u32)> {
         .flat_map(|y| (0..a.width()).map(move |x| (x, y)))
         .filter(|&(x, y)| a.pixel(x, y) != b.pixel(x, y))
         .collect()
+}
+
+/// A closed square ring `side` metres on a side from (x, y).
+fn ring(x: f64, y: f64, w: f64, h: f64) -> Value {
+    json!({"type": "Polygon", "coordinates": [[[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]]]})
+}
+
+async fn id_of(value: Value) -> i64 {
+    value["id"].as_i64().expect("an id")
+}
+
+#[tokio::test]
+async fn partial_updates_keep_what_is_left_out() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Partial").await;
+    let room = id_of(
+        ok(
+            &rw,
+            "upsert_space",
+            json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Studio",
+                   "geometry": ring(0.0, 0.0, 4.0, 3.0), "wall_material": "stone", "reason": "test"}),
+        )
+        .await,
+    )
+    .await;
+    let lamp = id_of(
+        ok(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "floor_id": floor, "kind": "light", "name": "Lamp", "height": 2.4,
+                   "geometry": {"type": "Point", "coordinates": [1.0, 2.0]}, "attributes": {"watts": 9}, "reason": "test"}),
+        )
+        .await,
+    )
+    .await;
+    let before = ok(&rw, "get_floor", json!({"floor_id": floor})).await;
+
+    // A rename by id alone keeps the geometry, kind, floor and the rest.
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"id": lamp, "site_id": site, "name": "Reading lamp", "reason": "renamed"}),
+    )
+    .await;
+    ok(
+        &rw,
+        "upsert_space",
+        json!({"id": room, "site_id": site, "name": "Den", "reason": "renamed"}),
+    )
+    .await;
+    let after = ok(&rw, "get_floor", json!({"floor_id": floor})).await;
+    let (old_lamp, new_lamp) = (&before["objects"][0], &after["objects"][0]);
+    assert_eq!(new_lamp["name"], "Reading lamp");
+    for key in ["geometry", "kind", "floor_id", "attributes", "refs"] {
+        assert_eq!(new_lamp[key], old_lamp[key], "object {key} kept");
+    }
+    let (old_room, new_room) = (&before["spaces"][0], &after["spaces"][0]);
+    assert_eq!(new_room["name"], "Den");
+    for key in ["geometry", "kind", "wall_material", "attributes"] {
+        assert_eq!(new_room[key], old_room[key], "space {key} kept");
+    }
+    let found = ok(&rw, "find", json!({"site_id": site, "name": "Reading"})).await;
+    assert_eq!(found["objects"][0]["floor_id"], floor);
+
+    // New geometry alone keeps the name; null clears what may be cleared.
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"id": lamp, "site_id": site, "geometry": {"type": "Point", "coordinates": [3.0, 1.0]},
+               "height": null, "reason": "moved"}),
+    )
+    .await;
+    let history = ok(&rw, "history", json!({"kind": "object", "id": lamp, "limit": 1})).await;
+    assert_eq!(history[0]["after"]["name"], "Reading lamp");
+    assert_eq!(history[0]["after"]["height"], Value::Null);
+    assert_eq!(history[0]["after"]["floor_id"], floor);
+    assert_eq!(history[0]["reason"], "moved");
+
+    // On create the three are still required, and the error names the one
+    // missing.
+    let missing = call(
+        &rw,
+        "upsert_object",
+        json!({"site_id": site, "floor_id": floor, "kind": "light", "name": "No shape", "reason": "test"}),
+    )
+    .await
+    .expect_err("geometry is required on create");
+    assert!(
+        missing.contains("geometry") && missing.contains("required"),
+        "{missing}"
+    );
+    let missing = call(
+        &rw,
+        "upsert_space",
+        json!({"site_id": site, "kind": "room", "geometry": ring(5.0, 0.0, 1.0, 1.0), "reason": "test"}),
+    )
+    .await
+    .expect_err("name is required on create");
+    assert!(missing.contains("name"), "{missing}");
+    let missing = call(
+        &rw,
+        "upsert_space",
+        json!({"site_id": site, "name": "Kindless", "geometry": ring(5.0, 0.0, 1.0, 1.0), "reason": "test"}),
+    )
+    .await
+    .expect_err("kind is required on create");
+    assert!(missing.contains("kind"), "{missing}");
+}
+
+/// Three 3 by 3 m rooms in a row on one floor, a fourth apart from them, a
+/// door between the first two and an arch between the second and third,
+/// each across a wall drawn as the rooms' shared edge.
+async fn three_rooms(rw: &RunningService<RoleClient, ()>, site: i64, floor: i64) -> ([i64; 4], i64, i64) {
+    let mut rooms = [0; 4];
+    for (i, x) in [0.0, 3.0, 6.0, 20.0].into_iter().enumerate() {
+        rooms[i] = id_of(
+            ok(
+                rw,
+                "upsert_space",
+                json!({"site_id": site, "floor_id": floor, "kind": "room", "name": format!("Room {}", i + 1),
+                       "geometry": ring(x, 0.0, 3.0, 3.0), "reason": "test"}),
+            )
+            .await,
+        )
+        .await;
+    }
+    let opening = async |name: &str, x: f64, attributes: Value| {
+        id_of(
+            ok(
+                rw,
+                "upsert_object",
+                json!({"site_id": site, "floor_id": floor, "kind": "opening", "name": name,
+                       "geometry": {"type": "LineString", "coordinates": [[x, 1.0], [x, 2.0]]},
+                       "attributes": attributes, "reason": "test"}),
+            )
+            .await,
+        )
+        .await
+    };
+    let door = opening(
+        "Door",
+        3.0,
+        json!({"opening_type": "door", "hinge": "end", "swing": "right", "wall_depth": 0.3}),
+    )
+    .await;
+    let arch = opening("Arch", 6.0, json!({"opening_type": "arch", "wall_depth": 0.3})).await;
+    (rooms, door, arch)
+}
+
+#[tokio::test]
+async fn connections_lists_neighbours_and_finds_the_shortest_path() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let ro = client(&server, RO).await;
+    let (site, floor) = site_and_floor(&rw, "Connections").await;
+    let ([one, two, three, four], door, arch) = three_rooms(&rw, site, floor).await;
+    // A building outline round them all is never the room beyond a door.
+    ok(
+        &rw,
+        "upsert_space",
+        json!({"site_id": site, "floor_id": floor, "kind": "building", "name": "House",
+               "geometry": ring(-1.0, -1.0, 11.0, 5.0), "reason": "test"}),
+    )
+    .await;
+
+    // The middle room's neighbours, from geometry, with the read only token.
+    let middle = ok(&ro, "connections", json!({"space_id": two})).await;
+    assert_eq!(middle["space"]["id"], two);
+    let mut found: Vec<(i64, String, i64)> = middle["connections"]
+        .as_array()
+        .expect("connections")
+        .iter()
+        .map(|c| {
+            (
+                c["opening"]["id"].as_i64().expect("opening"),
+                c["opening"]["opening_type"].as_str().expect("type").to_owned(),
+                c["other_side"]["id"].as_i64().expect("other side"),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(found, [(door, "door".into(), one), (arch, "arch".into(), three)]);
+    assert!(
+        middle["connections"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .all(|c| c["from"] == "geometry")
+    );
+    let end = ok(&ro, "connections", json!({"space_id": one})).await;
+    assert_eq!(end["connections"].as_array().expect("list").len(), 1);
+    assert_eq!(end["connections"][0]["other_side"]["id"], two);
+
+    // The way from the first room to the third: through the door and the arch.
+    let way = ok(&ro, "connections", json!({"from_space": one, "to_space": three})).await;
+    assert_eq!(way["openings_passed"], 2);
+    let steps: Vec<Value> = way["path"]
+        .as_array()
+        .expect("a path")
+        .iter()
+        .map(|step| match (step.get("space"), step.get("opening")) {
+            (Some(space), None) => json!({"space": space["id"]}),
+            (None, Some(opening)) => json!({"opening": opening["id"]}),
+            _ => panic!("a step is a space or an opening: {step}"),
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            json!({"space": one}),
+            json!({"opening": door}),
+            json!({"space": two}),
+            json!({"opening": arch}),
+            json!({"space": three})
+        ]
+    );
+
+    // No way into the room apart, and saying so plainly.
+    let none = ok(&ro, "connections", json!({"from_space": one, "to_space": four})).await;
+    assert_eq!(none["path"], Value::Null);
+    assert_eq!(
+        none["message"],
+        "No path from Room 1 to Room 4 through recorded openings."
+    );
+
+    // `connects` names the spaces outright, and a bad one is reported and
+    // passed over.
+    ok(
+        &rw,
+        "set_attributes",
+        json!({"kind": "object", "id": door, "set": {"connects": [one, four]}, "reason": "test"}),
+    )
+    .await;
+    let way = ok(&ro, "connections", json!({"from_space": one, "to_space": four})).await;
+    assert_eq!(way["openings_passed"], 1);
+    ok(
+        &rw,
+        "set_attributes",
+        json!({"kind": "object", "id": door, "set": {"connects": [one, 999_999]}, "reason": "test"}),
+    )
+    .await;
+    let middle = ok(&ro, "connections", json!({"space_id": two})).await;
+    assert_eq!(middle["connections"].as_array().expect("list").len(), 2);
+    assert!(middle["warnings"][0].as_str().expect("a warning").contains("999999"));
+
+    // Asking wrongly names the field.
+    let error = call(&ro, "connections", json!({"from_space": one}))
+        .await
+        .expect_err("needs to_space");
+    assert!(error.contains("to_space"), "{error}");
+    let error = call(&ro, "connections", json!({"space_id": 999_999}))
+        .await
+        .expect_err("no space");
+    assert!(error.contains("space_id"), "{error}");
+}
+
+#[tokio::test]
+async fn set_site_origin_places_a_site_and_is_recorded() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let ro = client(&server, RO).await;
+    let site = id_of(ok(&rw, "create_site", json!({"name": "Unplaced", "reason": "test"})).await).await;
+    let square =
+        json!({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": square(9.0)}});
+    let refused = call(
+        &rw,
+        "import_geojson",
+        json!({"site_id": site, "geojson": square, "as": "space", "kind": "parcel", "reason": "test"}),
+    )
+    .await
+    .expect_err("no georeference yet");
+    assert!(refused.contains("georeference"), "{refused}");
+
+    let set = ok(
+        &rw,
+        "set_site_origin",
+        json!({"site_id": site, "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "rotation": 10.0, "reason": "origin from the survey"}),
+    )
+    .await;
+    assert!((set["origin_wgs84"]["lon"].as_f64().expect("lon") - 9.0).abs() < 1e-9);
+    assert!((set["origin_wgs84"]["lat"].as_f64().expect("lat") - 45.0).abs() < 1e-9);
+    assert_eq!(set["rotation"], 10.0);
+    let sites = ok(&ro, "list_sites", json!({})).await;
+    assert_eq!(sites[0]["georeferenced"], true);
+    assert_eq!(sites[0]["rotation"], 10.0);
+    // Now geographic input lands in the frame.
+    ok(
+        &rw,
+        "import_geojson",
+        json!({"site_id": site, "geojson": square, "as": "space", "kind": "parcel", "reason": "test"}),
+    )
+    .await;
+
+    // Moved again, the rotation left out stays; both writes are in history.
+    let moved = ok(
+        &rw,
+        "set_site_origin",
+        json!({"site_id": site, "origin": {"epsg": 32632, "x": 500000.0, "y": 5000000.0}, "reason": "moved the origin"}),
+    )
+    .await;
+    assert_eq!(moved["rotation"], 10.0);
+    let history = ok(&ro, "history", json!({"kind": "site", "id": site})).await;
+    let reasons: Vec<Value> = column(&history, "reason");
+    assert_eq!(
+        &reasons[..2],
+        [json!("moved the origin"), json!("origin from the survey")]
+    );
+    assert_eq!(history[0]["author"], "jesse");
+
+    // Refusals name their field, and the read only token cannot set it.
+    for (args, field) in [
+        (
+            json!({"site_id": site, "origin": {"epsg": 999_999, "x": 0.0, "y": 0.0}, "reason": "test"}),
+            "origin.epsg",
+        ),
+        (
+            json!({"site_id": site, "origin": {"epsg": 4326, "x": -120.0, "y": 45.0}, "reason": "test"}),
+            "origin",
+        ),
+        (
+            json!({"site_id": site, "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "rotation": 400.0, "reason": "test"}),
+            "rotation",
+        ),
+        (
+            json!({"site_id": 999_999, "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
+            "site_id",
+        ),
+    ] {
+        let error = call(&rw, "set_site_origin", args).await.expect_err("refused");
+        assert!(
+            error.starts_with(&format!("{field}:")) || error.contains(&format!("{field}:")),
+            "{error}"
+        );
+    }
+    let error = call(
+        &ro,
+        "set_site_origin",
+        json!({"site_id": site, "origin": {"epsg": 4326, "x": 9.0, "y": 45.0}, "reason": "test"}),
+    )
+    .await
+    .expect_err("read only");
+    assert!(error.contains("read and write token"), "{error}");
+}
+
+#[tokio::test]
+async fn what_is_at_without_a_floor_searches_outdoors_and_every_floor() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, ground) = site_and_floor(&rw, "Floors").await;
+    let upper = id_of(
+        ok(
+            &rw,
+            "upsert_floor",
+            json!({"site_id": site, "name": "Upper", "level": 1, "reason": "test"}),
+        )
+        .await,
+    )
+    .await;
+    for (floor, name) in [(Some(ground), "Kitchen"), (Some(upper), "Bedroom"), (None, "Garden")] {
+        let (x, side) = if floor.is_some() { (0.0, 4.0) } else { (-10.0, 30.0) };
+        ok(
+            &rw,
+            "upsert_space",
+            json!({"site_id": site, "floor_id": floor, "kind": if floor.is_some() { "room" } else { "garden_bed" },
+                   "name": name, "geometry": ring(x, if floor.is_some() { 0.0 } else { -10.0 }, side, side), "reason": "test"}),
+        )
+        .await;
+    }
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"site_id": site, "floor_id": upper, "kind": "light", "name": "Upstairs light",
+               "geometry": {"type": "Point", "coordinates": [2.0, 2.2]}, "reason": "test"}),
+    )
+    .await;
+    let everywhere = ok(&rw, "what_is_at", json!({"site_id": site, "x": 2.0, "y": 2.0})).await;
+    assert_eq!(everywhere["searched"], "outdoors and every floor");
+    let hits: Vec<(String, Value)> = everywhere["spaces"]
+        .as_array()
+        .expect("spaces")
+        .iter()
+        .map(|s| (s["name"].as_str().expect("name").to_owned(), s["floor"]["name"].clone()))
+        .collect();
+    assert_eq!(
+        hits,
+        [
+            ("Garden".into(), Value::Null),
+            ("Kitchen".into(), json!("Ground")),
+            ("Bedroom".into(), json!("Upper"))
+        ]
+    );
+    assert_eq!(everywhere["objects"][0]["floor"]["level"], 1);
+    let ground_only = ok(
+        &rw,
+        "what_is_at",
+        json!({"site_id": site, "floor_id": ground, "x": 2.0, "y": 2.0}),
+    )
+    .await;
+    assert_eq!(sorted_names(&ground_only, "spaces"), ["Garden", "Kitchen"]);
+    assert_eq!(ground_only["objects"], json!([]));
+}
+
+#[tokio::test]
+async fn sites_and_floors_keep_attributes() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let ro = client(&server, RO).await;
+    let (site, floor) = site_and_floor(&rw, "Attributed").await;
+    let sites = ok(&ro, "list_sites", json!({})).await;
+    assert_eq!(sites[0]["attributes"], json!({}));
+    assert_eq!(sites[0]["floors"][0]["attributes"], json!({}));
+    let set = ok(
+        &rw,
+        "set_attributes",
+        json!({"kind": "site", "id": site, "set": {"survey": "sheet 1", "scale": 100}, "reason": "provenance"}),
+    )
+    .await;
+    assert_eq!(set["attributes"], json!({"survey": "sheet 1", "scale": 100}));
+    ok(
+        &rw,
+        "set_attributes",
+        json!({"kind": "site", "id": site, "remove": ["scale"], "reason": "test"}),
+    )
+    .await;
+    ok(
+        &rw,
+        "set_attributes",
+        json!({"kind": "floor", "id": floor, "set": {"source_drawing": "sheet 2"}, "reason": "provenance"}),
+    )
+    .await;
+    let sites = ok(&ro, "list_sites", json!({})).await;
+    assert_eq!(sites[0]["attributes"], json!({"survey": "sheet 1"}));
+    assert_eq!(
+        sites[0]["floors"][0]["attributes"],
+        json!({"source_drawing": "sheet 2"})
+    );
+    let got = ok(&ro, "get_floor", json!({"floor_id": floor})).await;
+    assert_eq!(got["attributes"], json!({"source_drawing": "sheet 2"}));
+    let history = ok(&ro, "history", json!({"kind": "floor", "id": floor, "limit": 1})).await;
+    assert_eq!(history[0]["reason"], "provenance");
+    let error = call(
+        &rw,
+        "set_attributes",
+        json!({"kind": "floor", "id": 999_999, "set": {"a": 1}, "reason": "test"}),
+    )
+    .await
+    .expect_err("no floor");
+    assert!(error.contains("id"), "{error}");
+}
+
+#[tokio::test]
+async fn a_drawing_of_the_grounds_imports_onto_the_site() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Grounds").await;
+    let dxf = two_room_dxf();
+    let file = ok(
+        &rw,
+        "upload_file",
+        json!({"name": "grounds.dxf", "base64": STANDARD.encode(&dxf), "reason": "test"}),
+    )
+    .await;
+    let layers = json!({"A-ROOM": {"space": "terrace"}, "E-LIGHT": {"object": "light"}});
+    let import = ok(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "site_id": site, "layers": layers, "reason": "grounds"}),
+    )
+    .await;
+    assert_eq!(import["linework"], 5);
+    assert_eq!(import["replaced_import_id"], Value::Null);
+    // Its spaces and objects are outdoor ones.
+    let found = ok(&rw, "find", json!({"site_id": site, "kind": "terrace"})).await;
+    assert_eq!(column(&found["spaces"], "floor_id"), [Value::Null, Value::Null]);
+    let outdoors = ok(&rw, "what_is_at", json!({"site_id": site, "x": 1.0, "y": 1.0})).await;
+    assert_eq!(outdoors["spaces"][0]["floor"], Value::Null);
+
+    // The site plan draws its linework; the floor's plan does not.
+    let site_plan = draw(&rw, json!({"site_id": site})).await;
+    assert!(site_plan.svg.contains(r##"stroke="#8a8a8a""##), "linework drawn");
+    let linework_only = draw(
+        &rw,
+        json!({"site_id": site, "layers": {"spaces": false, "objects": [], "labels": false}}),
+    )
+    .await;
+    assert!(linework_only.svg.matches(r##"stroke="#8a8a8a""##).count() >= 2);
+    ok(
+        &rw,
+        "upsert_space",
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Hall", "geometry": ring(0.0, 0.0, 2.0, 2.0), "reason": "test"}),
+    )
+    .await;
+    let floor_plan = draw(&rw, json!({"site_id": site, "floor_id": floor})).await;
+    assert!(
+        !floor_plan.svg.contains(r##"stroke="#8a8a8a""##),
+        "no site linework on a floor"
+    );
+
+    // A second import of the same drawing onto the site replaces the first.
+    let again = ok(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "site_id": site, "layers": layers, "reason": "again"}),
+    )
+    .await;
+    assert_eq!(again["replaced_import_id"], import["import_id"]);
+    let found = ok(&rw, "find", json!({"site_id": site, "kind": "terrace"})).await;
+    assert_eq!(found["spaces"].as_array().expect("spaces").len(), 2);
+
+    // Neither a floor nor a site, or a site that is not the floor's, is refused.
+    let error = call(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "reason": "test"}),
+    )
+    .await
+    .expect_err("no place");
+    assert!(error.contains("floor_id:"), "{error}");
+    let other = id_of(ok(&rw, "create_site", json!({"name": "Elsewhere", "reason": "test"})).await).await;
+    let error = call(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "floor_id": floor, "site_id": other, "reason": "test"}),
+    )
+    .await
+    .expect_err("wrong site");
+    assert!(error.contains("site_id:"), "{error}");
+}
+
+#[tokio::test]
+async fn a_scratch_floor_draws_its_door_arch_and_crowded_labels() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Drawn").await;
+    let _ = three_rooms(&rw, site, floor).await;
+    // A small room crowded with five labelled objects.
+    ok(
+        &rw,
+        "upsert_space",
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Alcove",
+               "geometry": ring(9.0, 0.0, 1.2, 1.2), "reason": "test"}),
+    )
+    .await;
+    for i in 0..5 {
+        let (x, y) = (9.2 + 0.18 * f64::from(i), 0.3 + 0.15 * f64::from(i));
+        ok(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "floor_id": floor, "kind": "furniture", "name": format!("Piece {i}"),
+                   "geometry": {"type": "Point", "coordinates": [x, y]}, "reason": "test"}),
+        )
+        .await;
+    }
+    for size in ["normal", "large"] {
+        let drawn = draw(&rw, json!({"site_id": site, "floor_id": floor, "label_size": size})).await;
+        assert_eq!(drawn.svg.matches(r#"class="door-leaf""#).count(), 1);
+        assert_eq!(drawn.svg.matches(r#"class="door-swing""#).count(), 1);
+        assert_eq!(drawn.svg.matches(r#"class="arch-face""#).count(), 2);
+        for name in ["Room 1", "Room 2", "Room 3", "Alcove", "Piece 0", "Piece 4"] {
+            assert!(drawn.svg.contains(&format!(">{name}</text>")), "{size}: {name}");
+        }
+    }
+    let refused = call(
+        &rw,
+        "render_plan",
+        json!({"site_id": site, "floor_id": floor, "label_size": "huge"}),
+    )
+    .await
+    .expect("a tool result");
+    assert_eq!(refused.is_error, Some(true));
+    let text = &refused.content[0].as_text().expect("text").text;
+    assert!(text.contains("huge") && text.contains("large"), "{text}");
+}
+
+/// A floor shaped like a real one: 25 rooms of irregular outline, objects
+/// in them, and an update by id sent with everything get_floor returned for
+/// it, as a caller that read the floor and changed one field would send.
+#[tokio::test]
+async fn upsert_floor_takes_a_real_floors_payload() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Payload").await;
+    for i in 0..25 {
+        let (x, y) = (f64::from(i % 5) * 4.0, f64::from(i / 5) * 4.0);
+        // An outline of twelve vertices, a room with a chimney breast.
+        let outline = json!({"type": "Polygon", "coordinates": [[
+            [x, y], [x + 1.5, y], [x + 1.5, y + 0.3], [x + 2.1, y + 0.3], [x + 2.1, y], [x + 3.8, y],
+            [x + 3.8, y + 3.8], [x + 2.0, y + 3.8], [x + 2.0, y + 3.5], [x + 1.0, y + 3.5], [x + 1.0, y + 3.8],
+            [x, y + 3.8], [x, y]
+        ]]});
+        ok(
+            &rw,
+            "upsert_space",
+            json!({"site_id": site, "floor_id": floor, "kind": "room", "name": format!("Stanza {i}"),
+                   "geometry": outline, "attributes": {"name_en": format!("Room {i}"), "area_m2": 13.5}, "reason": "test"}),
+        )
+        .await;
+        ok(
+            &rw,
+            "upsert_object",
+            json!({"site_id": site, "floor_id": floor, "kind": "light", "name": format!("Light {i}"),
+                   "geometry": {"type": "Point", "coordinates": [x + 1.9, y + 1.9]}, "reason": "test"}),
+        )
+        .await;
+    }
+    let mut payload = ok(&rw, "get_floor", json!({"floor_id": floor})).await;
+    assert_eq!(payload["spaces"].as_array().expect("spaces").len(), 25);
+    for round in 0..20 {
+        payload["name"] = json!(format!("Ground, round {round}"));
+        payload["ceiling_height"] = json!(2.7);
+        payload["reason"] = json!("renamed with the whole floor sent back");
+        payload["id"] = json!(floor);
+        let updated = ok(&rw, "upsert_floor", payload.clone()).await;
+        assert_eq!(updated["id"], floor);
+    }
+    let after = ok(&rw, "get_floor", json!({"floor_id": floor})).await;
+    assert_eq!(after["name"], "Ground, round 19");
+    assert_eq!(after["spaces"], payload["spaces"], "the rooms are untouched");
+    // Sixteen at once from separate clients, twice the pool's connections,
+    // as parallel callers would send them.
+    let mut calls = tokio::task::JoinSet::new();
+    for i in 0..16 {
+        let mut payload = payload.clone();
+        payload["name"] = json!(format!("Parallel {i}"));
+        let caller = client(&server, RW).await;
+        calls.spawn(async move { call(&caller, "upsert_floor", payload).await });
+    }
+    while let Some(result) = calls.join_next().await {
+        result.expect("a task").expect("upsert_floor");
+    }
 }

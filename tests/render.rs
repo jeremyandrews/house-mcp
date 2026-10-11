@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 
 use house_mcp::{
     geom::to_wkb,
-    render::{Extent, Feature, Label, Plan, Rendered, Style, render},
+    render::{Extent, Feature, Label, LabelSize, Plan, Rendered, Style, Symbol, render},
 };
 use resvg::tiny_skia::Pixmap;
 use serde_json::json;
@@ -31,6 +31,7 @@ fn plan(highlight_light: bool) -> Plan {
     let room = |x0: f64, x1: f64| json!({"type": "Polygon", "coordinates": [[[x0, 0.0], [x1, 0.0], [x1, 3.0], [x0, 3.0], [x0, 0.0]]]});
     Plan {
         title: "Test site, Ground".into(),
+        label_size: LabelSize::Normal,
         rotation: 30.0,
         extent: Extent {
             xmin: 0.0,
@@ -157,6 +158,7 @@ fn room_plan(dx: f64, dy: f64, rotation: f64) -> Plan {
     let room = json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [dx, 0.0], [dx, dy], [0.0, dy], [0.0, 0.0]]]});
     Plan {
         title: "Shape".into(),
+        label_size: LabelSize::Normal,
         rotation,
         extent: Extent {
             xmin: 0.0,
@@ -235,12 +237,21 @@ fn a_long_label_at_the_plan_edge_stays_out_from_under_the_north_arrow() {
                 let under_arrow = arrow_x.contains(&x) && arrow_y.contains(&y);
                 assert!(!under_arrow, "{case}: label under the arrow at ({x}, {y})");
             }
-            // At 1600 px the lowest label is well below the arrow, so it runs
-            // on into the arrow's column unclipped.
-            if size == 1600 && y == 0.5 {
+            // Nothing is cut: the label is drawn whole somewhere, or listed
+            // whole in the legend.
+            let rendered = render(&with_light(0.0, y, true), size).expect("renders");
+            assert!(
+                rendered.svg.contains(">A ceiling light with a long name</text>"),
+                "{case}: label cut"
+            );
+            // At 1600 px there is room left of the light, so the label is
+            // drawn there rather than off the image's right edge.
+            if size == 1600 {
+                assert!(rendered.legend.is_empty(), "{case}: {:?}", rendered.legend);
+                let (light_x, _) = at(9.0, y);
                 assert!(
-                    text.iter().any(|&(x, _)| arrow_x.contains(&x)),
-                    "{case}: label clipped in the column below the arrow"
+                    text.iter().all(|&(x, _)| x < light_x + 8),
+                    "{case}: label right of the light"
                 );
             }
         }
@@ -306,6 +317,7 @@ fn tall_plan_fits_the_long_side_with_room_for_the_footer() {
     let outline = json!({"type": "LineString", "coordinates": [[0.0, 0.0], [3.0, 9.0]]});
     let plan = Plan {
         title: "Tall".into(),
+        label_size: LabelSize::Normal,
         rotation: 0.0,
         extent: Extent {
             xmin: 0.0,
@@ -325,4 +337,327 @@ fn tall_plan_fits_the_long_side_with_room_for_the_footer() {
     assert_eq!(pixmap.width(), (3.0 * scale + 120.0_f64).round() as u32);
     let (x, y) = ((40.0 + 2.5 * scale).round() as u32, (40.0 + 8.8 * scale).round() as u32);
     assert_ne!(pixel(&png, x, y), (255, 255, 255), "the bottom of the room is drawn");
+}
+
+/// Every `<text>` element's attributes and content, in order.
+fn texts(svg: &str) -> Vec<(String, String)> {
+    svg.split("<text ")
+        .skip(1)
+        .filter_map(|rest| {
+            let (attributes, rest) = rest.split_once('>')?;
+            let (content, _) = rest.split_once("</text>")?;
+            Some((attributes.to_owned(), content.to_owned()))
+        })
+        .collect()
+}
+
+/// A number attribute of an element.
+fn number(attributes: &str, name: &str) -> f64 {
+    let start = attributes
+        .find(&format!(" {name}=\""))
+        .or_else(|| attributes.find(&format!("{name}=\"")))
+        .expect(name);
+    let rest = &attributes[start..];
+    let value = rest.split('"').nth(1).expect("a value");
+    value.parse().expect("a number")
+}
+
+/// The attributes of the `<text>` holding exactly `text`.
+fn text_attributes(svg: &str, text: &str) -> String {
+    texts(svg)
+        .into_iter()
+        .find(|(_, content)| content == text)
+        .unwrap_or_else(|| panic!("no text {text}"))
+        .0
+}
+
+/// One room filling a 9 by 3 m plan, and lights at the given points with
+/// the given labels.
+fn lights(at: &[(&str, f64, f64)]) -> Plan {
+    let mut plan = room_plan(9.0, 3.0, 0.0);
+    for &(label, x, y) in at {
+        plan.features.push(feature(
+            json!({"type": "Point", "coordinates": [x, y]}),
+            Style::Object { kind: "light".into() },
+            Some((label, x, y)),
+            false,
+        ));
+    }
+    plan
+}
+
+#[test]
+fn two_overlapping_labels_move_apart() {
+    let rendered = render(&lights(&[("Pendant", 4.0, 1.5), ("Spotlight", 4.0, 1.5)]), 1600).expect("renders");
+    let a = text_attributes(&rendered.svg, "Pendant");
+    let b = text_attributes(&rendered.svg, "Spotlight");
+    let size = number(&a, "font-size");
+    assert_eq!(size, 11.0, "both fit at full size");
+    let (ya, yb) = (number(&a, "y"), number(&b, "y"));
+    assert!((ya - yb).abs() >= 1.2 * size, "labels {ya} and {yb} overlap");
+    // The first keeps its place right of the light; the second moved.
+    let (light_x, light_y) = at(4.0, 1.5);
+    assert!(number(&a, "x") > f64::from(light_x));
+    assert!(
+        (ya - (f64::from(light_y) + size / 3.0)).abs() < 1.0,
+        "first label at its anchor"
+    );
+    assert!(rendered.legend.is_empty());
+}
+
+#[test]
+fn a_label_with_no_room_becomes_a_numbered_marker_and_a_legend_entry() {
+    // Twenty labels on one point of a small image cannot all stand there.
+    let names: Vec<String> = (1..=20).map(|i| format!("Ceiling light number {i}")).collect();
+    let crowd: Vec<(&str, f64, f64)> = names.iter().map(|n| (n.as_str(), 4.5, 1.5)).collect();
+    let rendered = render(&lights(&crowd), 400).expect("renders");
+    assert!(!rendered.legend.is_empty(), "some labels went to the legend");
+    assert!(rendered.svg.contains(r#"class="label-marker""#));
+    let markers = rendered.svg.matches(r#"class="label-marker""#).count();
+    assert_eq!(markers, rendered.legend.len(), "one marker per legend entry");
+    for (i, entry) in rendered.legend.iter().enumerate() {
+        // The marker's number and the legend's, and the entry in full.
+        assert!(rendered.svg.contains(&format!(">{}</text>", i + 1)));
+        assert!(rendered.svg.contains(&format!(">{entry}</text>")), "{entry}");
+    }
+    // The legend is in the footer, below every marker on the plan, and the
+    // image still keeps to its size.
+    let pixmap = Pixmap::decode_png(&rendered.png).expect("a PNG");
+    assert_eq!(pixmap.width().max(pixmap.height()), 400);
+    let lowest_marker = rendered
+        .svg
+        .split(r#"class="label-marker"><circle "#)
+        .skip(1)
+        .map(|circle| number(circle, "cy"))
+        .fold(0.0, f64::max);
+    for entry in &rendered.legend {
+        assert!(number(&text_attributes(&rendered.svg, entry), "y") > lowest_marker + 20.0);
+    }
+}
+
+#[test]
+fn no_label_is_ever_cut_short() {
+    let names: Vec<String> = (1..=30)
+        .map(|i| format!("A light with a long descriptive name, number {i}"))
+        .collect();
+    // A wrapped legend entry's text with its line breaks put back as spaces.
+    let plain = |content: &str| {
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in content.replace("</tspan><tspan", "</tspan> <tspan").chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        text
+    };
+    for size in [200, 600, 1600] {
+        let crowd: Vec<(&str, f64, f64)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), 0.3 * (i % 10) as f64 + 3.0, 1.0 + 0.1 * (i / 10) as f64))
+            .collect();
+        let rendered = render(&lights(&crowd), size).expect("renders");
+        let drawn: Vec<String> = texts(&rendered.svg).into_iter().map(|(_, t)| plain(&t)).collect();
+        let mut in_legend = 0;
+        for name in &names {
+            // Each name appears whole, once, either by its light or in the
+            // legend.
+            assert_eq!(
+                drawn.iter().filter(|t| *t == name).count(),
+                1,
+                "at {size} px, {name} is missing, cut or doubled"
+            );
+            in_legend += usize::from(rendered.legend.contains(name));
+        }
+        assert_eq!(in_legend, rendered.legend.len());
+        assert!(in_legend > 0, "at {size} px some labels need the legend");
+        // A legend the image can hold leaves its size alone; at the smaller
+        // sizes this one cannot be held, and the image grows taller rather
+        // than cut it, keeping its width.
+        let pixmap = Pixmap::decode_png(&rendered.png).expect("a PNG");
+        assert!(pixmap.width() <= size);
+        if size == 1600 {
+            assert_eq!(pixmap.width().max(pixmap.height()), size);
+        }
+    }
+}
+
+#[test]
+fn label_size_scales_the_label_font() {
+    let sizes: Vec<f64> = [LabelSize::Small, LabelSize::Normal, LabelSize::Large]
+        .into_iter()
+        .map(|label_size| {
+            let mut plan = plan(false);
+            plan.label_size = label_size;
+            let svg = render(&plan, 1600).expect("renders").svg;
+            number(&text_attributes(&svg, "Kitchen"), "font-size")
+        })
+        .collect();
+    assert_eq!(sizes[1], 14.0);
+    assert!(sizes[0] < sizes[1] && sizes[1] < sizes[2], "{sizes:?}");
+}
+
+/// A 6 by 4 m plan, with room for any swing, and one opening from (2, 2)
+/// to (3.6, 2), running east along a wall 0.3 m deep.
+fn opening(symbol: Symbol) -> String {
+    let mut plan = room_plan(6.0, 4.0, 0.0);
+    plan.features.push(feature(
+        json!({"type": "LineString", "coordinates": [[2.0, 2.0], [3.6, 2.0]]}),
+        Style::Opening {
+            from: (2.0, 2.0),
+            to: (3.6, 2.0),
+            wall_depth: 0.3,
+            symbol,
+        },
+        None,
+        false,
+    ));
+    render(&plan, 1600).expect("renders").svg
+}
+
+/// The pixel of a site point on the 6 by 4 m plan at 1600 px.
+fn px6(x: f64, y: f64) -> (f64, f64) {
+    let scale = 1480.0 / 6.0;
+    (40.0 + x * scale, 40.0 + (4.0 - y) * scale)
+}
+
+/// The `<line>` elements with this class, as (x1, y1, x2, y2).
+fn lines(svg: &str, class: &str) -> Vec<(f64, f64, f64, f64)> {
+    svg.split("<line ")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("/>").map(|(a, _)| a))
+        .filter(|a| a.contains(&format!(r#"class="{class}""#)))
+        .map(|a| (number(a, "x1"), number(a, "y1"), number(a, "x2"), number(a, "y2")))
+        .collect()
+}
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 0.05
+}
+
+#[test]
+fn an_arch_is_two_dashed_lines_along_the_wall_faces_and_no_curve() {
+    let svg = opening(Symbol::Arch);
+    let faces = lines(&svg, "arch-face");
+    assert_eq!(faces.len(), 2);
+    assert_eq!(svg.matches("<line ").count(), 4, "two jamb ticks and two faces");
+    assert_eq!(svg.matches("stroke-dasharray").count(), 2);
+    assert!(!svg.contains("<path class"), "no curve");
+    let (x0, _) = px6(2.0, 1.5);
+    let (x1, _) = px6(3.6, 1.5);
+    for face in &faces {
+        // Straight across from jamb to jamb.
+        assert!(near(face.1, face.3), "straight across");
+        assert!(near(face.0.min(face.2), x0) && near(face.0.max(face.2), x1));
+    }
+    // One along each face of the 0.3 m wall, 0.15 m either side of its
+    // centre line.
+    let mut ys: Vec<f64> = faces.iter().map(|f| f.1).collect();
+    ys.sort_by(f64::total_cmp);
+    assert!(near(ys[0], px6(0.0, 2.15).1) && near(ys[1], px6(0.0, 1.85).1), "{ys:?}");
+    let plain = opening(Symbol::Plain);
+    assert_eq!(plain.matches("<line ").count(), 2);
+    assert_eq!(plain.matches("stroke-dasharray").count(), 0);
+}
+
+#[test]
+fn a_door_hangs_from_its_hinge_and_swings_to_its_side() {
+    let (start, _) = px6(2.0, 1.5);
+    let (end, _) = px6(3.6, 1.5);
+    let width = 1.6 * 1480.0 / 6.0;
+    for (hinge_end, swing_right) in [(false, false), (true, true), (false, true), (true, false)] {
+        let svg = opening(Symbol::Door {
+            hinge_end,
+            swing_right,
+            double: false,
+        });
+        let case = format!(
+            "hinge at the {}, swinging {}",
+            if hinge_end { "end" } else { "start" },
+            if swing_right { "right" } else { "left" }
+        );
+        let leaves = lines(&svg, "door-leaf");
+        assert_eq!(leaves.len(), 1, "{case}");
+        let (x1, y1, x2, y2) = leaves[0];
+        // The leaf stands square to the wall at the hinge jamb, from the
+        // face on its side; the line runs east, so left is up the image.
+        let hinge = if hinge_end { end } else { start };
+        assert!(near(x1, hinge) && near(x2, hinge), "{case}: leaf at x = {x1}, {x2}");
+        let face = px6(0.0, if swing_right { 1.85 } else { 2.15 }).1;
+        assert!(near(y1, face), "{case}: leaf starts at y = {y1}");
+        let reach = if swing_right { width } else { -width };
+        assert!(near(y2 - y1, reach), "{case}: leaf reaches {}", y2 - y1);
+        // The swing runs from the leaf's tip to the other jamb.
+        assert_eq!(svg.matches(r#"class="door-swing""#).count(), 1, "{case}");
+        let other = if hinge_end { start } else { end };
+        let swing = svg
+            .split(r#"class="door-swing" d="M"#)
+            .nth(1)
+            .expect("swing")
+            .split('"')
+            .next()
+            .expect("d");
+        let numbers: Vec<f64> = swing
+            .split([' ', 'A'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().expect("a number"))
+            .collect();
+        assert!(
+            near(numbers[0], x2) && near(numbers[1], y2),
+            "{case}: swing starts at the tip"
+        );
+        let (ex, ey) = (numbers[numbers.len() - 2], numbers[numbers.len() - 1]);
+        assert!(near(ex, other) && near(ey, face), "{case}: swing ends at ({ex}, {ey})");
+        assert!(near(numbers[2], width), "{case}: a quarter circle as wide as the door");
+    }
+}
+
+#[test]
+fn a_pair_of_doors_draws_two_half_leaves_from_both_jambs() {
+    let svg = opening(Symbol::Door {
+        hinge_end: false,
+        swing_right: false,
+        double: true,
+    });
+    let leaves = lines(&svg, "door-leaf");
+    assert_eq!(leaves.len(), 2);
+    assert_eq!(svg.matches(r#"class="door-swing""#).count(), 2);
+    let (start, _) = px6(2.0, 1.5);
+    let (end, _) = px6(3.6, 1.5);
+    let half = 0.8 * 1480.0 / 6.0;
+    let mut xs: Vec<f64> = leaves.iter().map(|l| l.0).collect();
+    xs.sort_by(f64::total_cmp);
+    assert!(near(xs[0], start) && near(xs[1], end), "{xs:?}");
+    for (_, y1, _, y2) in leaves {
+        assert!(near(y1 - y2, half), "half a leaf each");
+    }
+}
+
+#[test]
+fn a_door_opening_out_of_the_plan_stays_in_the_image() {
+    // A door in the north wall of a 6 by 3 m room, opening outwards.
+    let mut plan = room_plan(6.0, 3.0, 0.0);
+    plan.features.push(feature(
+        json!({"type": "LineString", "coordinates": [[2.0, 3.0], [3.0, 3.0]]}),
+        Style::Opening {
+            from: (2.0, 3.0),
+            to: (3.0, 3.0),
+            wall_depth: 0.3,
+            symbol: Symbol::Door {
+                hinge_end: false,
+                swing_right: false,
+                double: false,
+            },
+        },
+        None,
+        false,
+    ));
+    let svg = render(&plan, 1600).expect("renders").svg;
+    let (_, y1, _, y2) = lines(&svg, "door-leaf")[0];
+    assert!(y2 < y1, "the leaf opens north, up the image");
+    assert!(y2 >= 40.0 - 0.01, "the leaf's tip is inside the margin, at {y2}");
 }

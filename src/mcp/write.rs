@@ -112,7 +112,7 @@ pub struct UpsertObjectParams {
     /// Omit for something outdoors.
     pub floor_id: Option<i64>,
     /// light, switch, socket, access_point, camera, sensor, speaker, tree,
-    /// pipe, cable_run, or another lowercase word.
+    /// pipe, cable_run, opening, or another lowercase word.
     pub kind: String,
     pub name: String,
     /// GeoJSON Point, LineString or Polygon (or a Multi of one) in the site
@@ -307,7 +307,7 @@ impl House {
     }
 
     #[tool(
-        description = "Create an object (a light, switch, socket, access point, camera, sensor, speaker, tree, pipe, cable run or anything else), or replace an existing one's fields when `id` is given."
+        description = "Create an object (a light, switch, socket, access point, camera, sensor, speaker, tree, pipe, cable run, opening or anything else), or replace an existing one's fields when `id` is given. An `opening` is an arch or open doorway that render_plan draws as a gap in the wall: its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. Attribute `opening_type` is `arch` (jamb ticks and a dashed curve) or `opening` (jamb ticks only), default `opening`; `wall_depth` is the wall's thickness in metres, a positive number, default 0.6, and the gap cut is that wide across the wall. Any other geometry is drawn as an ordinary object. Example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Arch to the hall\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[4.0, 1.2], [4.0, 2.8]]}, \"attributes\": {\"opening_type\": \"arch\", \"wall_depth\": 0.45}, \"reason\": \"arch on the survey\"}."
     )]
     async fn upsert_object(
         &self,
@@ -355,7 +355,9 @@ impl House {
         json_result(json!({ "id": id }))
     }
 
-    #[tool(description = "Add, change or remove some attributes of a space or object, leaving the rest as they are.")]
+    #[tool(
+        description = "Add, change or remove some attributes of a space or object, leaving the rest as they are. `common_name` is the family's nickname for a space or object and is what render_plan labels it with, ahead of `name_en` and the stored `name`."
+    )]
     async fn set_attributes(
         &self,
         Extension(parts): Extension<Parts>,

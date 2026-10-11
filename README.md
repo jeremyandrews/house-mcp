@@ -77,6 +77,37 @@ Units come from the drawing's `$INSUNITS` header. A drawing with no unit there i
 
 Importing the same file content onto the same floor again marks the earlier import and everything it made as deleted, then imports afresh. A DWG file can be stored but not imported; convert it to DXF with the free ODA File Converter first.
 
+### Plan labels
+
+`render_plan` labels each space and object from the first attribute in `label_from` that holds a non-empty string, and otherwise from the row's `name` exactly as stored. `label_from` defaults to `["common_name", "name_en"]`: the family's nickname first, then the English name. A label taken from an attribute loses a leading "the " and starts with a capital, so a `common_name` of `the snug` is drawn as `Snug`. An empty list labels everything by `name`:
+
+```json
+{"site_id": 1, "floor_id": 2, "label_from": []}
+```
+
+Nicknames are ordinary attributes, so `set_attributes` changes a label on the next render:
+
+```json
+{"kind": "space", "id": 7, "set": {"common_name": "the snug"}, "reason": "what we call it"}
+```
+
+### Openings
+
+An object of kind `opening` is an arch or open doorway. Its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. When `render_plan` draws that floor it removes the floor's linework within a flat ended buffer of the line, half of `wall_depth` to each side, and draws a jamb tick across the wall at each end; an arch also gets a dashed half ellipse across the gap. The stored linework is never changed, so moving or deleting the opening shows on the next render.
+
+| Attribute | Value | Default |
+| --- | --- | --- |
+| `opening_type` | `arch` or `opening` | `opening` |
+| `wall_depth` | the wall's thickness in metres, a positive number | 0.6 |
+
+Any other geometry, or a LineString of more than two points, is drawn as an ordinary object and logged as a warning.
+
+```json
+{"site_id": 1, "floor_id": 2, "kind": "opening", "name": "Arch to the hall",
+ "geometry": {"type": "LineString", "coordinates": [[4.0, 1.2], [4.0, 2.8]]},
+ "attributes": {"opening_type": "arch", "wall_depth": 0.45}, "reason": "arch on the survey"}
+```
+
 ### Limits
 
 | What | Limit |

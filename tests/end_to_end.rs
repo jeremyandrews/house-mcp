@@ -1226,3 +1226,266 @@ async fn a_site_without_a_georeference_refuses_geographic_input() {
     .expect_err("refused");
     assert!(error.contains("has no georeference"), "{error}");
 }
+
+#[tokio::test]
+async fn plan_labels_come_from_nicknames_then_english_names_then_names() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Labels").await;
+    let rooms = [
+        ("Stanza uno", json!({"common_name": "the snug", "name_en": "Lounge"})),
+        ("Stanza due", json!({"name_en": "pantry"})),
+        ("stanza tre", json!({})),
+        ("Stanza quattro", json!({"common_name": 7, "name_en": ""})),
+        ("Stanza cinque", json!({"common_name": " ", "name_en": "Attic"})),
+    ];
+    for (i, (name, attributes)) in rooms.iter().enumerate() {
+        let x = 4.0 * i as f64;
+        let ring = json!([[[x, 0.0], [x + 3.0, 0.0], [x + 3.0, 3.0], [x, 3.0], [x, 0.0]]]);
+        ok(
+            &rw,
+            "upsert_space",
+            json!({"site_id": site, "floor_id": floor, "kind": "room", "name": name,
+                   "geometry": {"type": "Polygon", "coordinates": ring}, "attributes": attributes, "reason": "test"}),
+        )
+        .await;
+    }
+    let labels = async |extra: Value| {
+        let mut args = json!({"site_id": site, "floor_id": floor});
+        args.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        let plan = call(&rw, "render_plan", args).await.expect("render_plan");
+        let svg = plan.content.iter().find_map(|c| c.as_text()).expect("svg").text.clone();
+        let mut found: Vec<String> = svg
+            .split("</text>")
+            .filter_map(|s| s.rsplit_once('>').map(|(_, text)| text.to_owned()))
+            .filter(|text| !text.is_empty() && text != "N" && !text.ends_with(" m") && !text.starts_with("Labels"))
+            .collect();
+        found.sort();
+        found
+    };
+    // The nickname without its article, capitalized; the English name
+    // capitalized; the name as stored; and empty or non-string values
+    // passed over.
+    assert_eq!(
+        labels(json!({})).await,
+        ["Attic", "Pantry", "Snug", "Stanza quattro", "stanza tre"]
+    );
+    assert_eq!(
+        labels(json!({"label_from": []})).await,
+        [
+            "Stanza cinque",
+            "Stanza due",
+            "Stanza quattro",
+            "Stanza uno",
+            "stanza tre"
+        ]
+    );
+    assert_eq!(
+        labels(json!({"label_from": ["name_en"]})).await,
+        ["Attic", "Lounge", "Pantry", "Stanza quattro", "stanza tre"]
+    );
+}
+
+/// A floor plan 6 by 3 metres in millimetres: a frame, a wall drawn as its
+/// centre line along y = 1.5 m, and the wall's two faces 0.2 m either side.
+fn walled_dxf() -> Vec<u8> {
+    use dxf::{Point, entities::Line};
+    let mut drawing = drawing(dxf::enums::Units::Millimeters);
+    drawing.add_entity(on_layer("A-WALL", rectangle(0.0, 0.0, 6000.0, 3000.0)));
+    for y in [1300.0, 1500.0, 1700.0] {
+        drawing.add_entity(on_layer(
+            "A-WALL",
+            dxf::entities::EntityType::Line(Line::new(Point::new(0.0, y, 0.0), Point::new(6000.0, y, 0.0))),
+        ));
+    }
+    save(&drawing)
+}
+
+/// The pixel of a site point on the walled floor at the default size: 40 px
+/// margins and 1480 / 6 px per metre.
+fn walled_px(x: f64, y: f64) -> (u32, u32) {
+    let scale = 1480.0 / 6.0;
+    (
+        (40.0 + x * scale).round() as u32,
+        (40.0 + (3.0 - y) * scale).round() as u32,
+    )
+}
+
+/// Whether anything is drawn within 4 px of a site point.
+fn inked(pixmap: &Pixmap, x: f64, y: f64) -> bool {
+    let (cx, cy) = walled_px(x, y);
+    (cx - 4..=cx + 4)
+        .flat_map(|x| (cy - 4..=cy + 4).map(move |y| (x, y)))
+        .any(|(x, y)| {
+            let p = pixmap.pixel(x, y).expect("inside");
+            (p.red(), p.green(), p.blue()) != (255, 255, 255)
+        })
+}
+
+struct Drawn {
+    pixmap: Pixmap,
+    svg: String,
+}
+
+async fn draw(client: &RunningService<RoleClient, ()>, args: Value) -> Drawn {
+    let plan = call(client, "render_plan", args).await.expect("render_plan");
+    let image = plan.content.iter().find_map(|c| c.as_image()).expect("image content");
+    let png = STANDARD.decode(&image.data).expect("base64");
+    Drawn {
+        pixmap: Pixmap::decode_png(&png).expect("a PNG"),
+        svg: plan.content.iter().find_map(|c| c.as_text()).expect("svg").text.clone(),
+    }
+}
+
+#[tokio::test]
+async fn openings_cut_the_walls_they_cross_and_draw_their_symbol() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let (site, floor) = site_and_floor(&rw, "Openings").await;
+    let other_floor = ok(
+        &rw,
+        "upsert_floor",
+        json!({"site_id": site, "name": "Upper", "level": 1, "reason": "test"}),
+    )
+    .await["id"]
+        .clone();
+    let dxf = walled_dxf();
+    let file = ok(
+        &rw,
+        "upload_file",
+        json!({"name": "walls.dxf", "base64": STANDARD.encode(&dxf), "reason": "test"}),
+    )
+    .await;
+    ok(
+        &rw,
+        "import_dxf",
+        json!({"file_sha256": file["sha256"], "floor_id": floor, "reason": "test"}),
+    )
+    .await;
+    let plain = json!({"site_id": site, "floor_id": floor});
+    // Without objects drawn, only the cut shows.
+    let walls_only = json!({"site_id": site, "floor_id": floor, "layers": {"objects": []}});
+    let before = draw(&rw, plain.clone()).await;
+    assert!(inked(&before.pixmap, 2.8, 1.5) && inked(&before.pixmap, 2.8, 1.7));
+
+    let arch_line = json!({"type": "LineString", "coordinates": [[2.0, 1.5], [3.6, 1.5]]});
+    let arch = ok(
+        &rw,
+        "upsert_object",
+        json!({"site_id": site, "floor_id": floor, "kind": "opening", "name": "Arch", "geometry": arch_line,
+               "attributes": {"opening_type": "arch"}, "reason": "test"}),
+    )
+    .await["id"]
+        .as_i64()
+        .expect("arch id");
+    let with_arch = draw(&rw, plain.clone()).await;
+    // The centre line and both faces are open across the arch.
+    for y in [1.3, 1.5, 1.7] {
+        assert!(!inked(&with_arch.pixmap, 2.8, y), "wall at y = {y} m is cut");
+        assert!(
+            inked(&with_arch.pixmap, 1.0, y),
+            "wall at y = {y} m is kept left of the arch"
+        );
+        assert!(
+            inked(&with_arch.pixmap, 4.6, y),
+            "wall at y = {y} m is kept right of the arch"
+        );
+    }
+    // Nothing is opened or drawn outside the arch: its width, its jambs
+    // 0.3 m either side of the wall, and its curve 0.4 m to the left. A wall
+    // drawn in two pieces may shade its edge pixels a little differently, so
+    // outside the arch a pixel may change but not go blank or gain ink.
+    let (left, top) = walled_px(2.0, 1.9);
+    let (right, bottom) = walled_px(3.6, 1.2);
+    let blank = |p: resvg::tiny_skia::PremultipliedColorU8| (p.red(), p.green(), p.blue()) == (255, 255, 255);
+    for (x, y) in changed_pixels(&before.pixmap, &with_arch.pixmap) {
+        let in_arch = (left - 3..=right + 3).contains(&x) && (top - 3..=bottom + 3).contains(&y);
+        let (was, is) = (
+            before.pixmap.pixel(x, y).expect("inside"),
+            with_arch.pixmap.pixel(x, y).expect("inside"),
+        );
+        assert!(in_arch || blank(was) == blank(is), "opened or inked at ({x}, {y})");
+    }
+    // The walls end at the jambs.
+    assert!(
+        with_arch.svg.contains("L533.33 410.00 M928.00 410.00"),
+        "centre line cut at x = 2 and 3.6 m"
+    );
+    assert_eq!(with_arch.svg.matches("<line ").count(), 2, "two jamb ticks");
+    assert_eq!(with_arch.svg.matches("stroke-dasharray").count(), 1, "one dashed curve");
+    assert!(!with_arch.svg.contains(">Arch</text>"), "openings have no label");
+    let highlighted = draw(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "highlight": [{"object": arch}]}),
+    )
+    .await;
+    assert_eq!(highlighted.svg.matches(r##"stroke="#e8590c""##).count(), 3);
+
+    // A plain opening has its ticks and no curve.
+    let set = async |attributes: Value| {
+        ok(
+            &rw,
+            "set_attributes",
+            json!({"kind": "object", "id": arch, "set": attributes, "reason": "test"}),
+        )
+        .await;
+    };
+    set(json!({"opening_type": "opening"})).await;
+    let opening = draw(&rw, plain.clone()).await;
+    assert_eq!(opening.svg.matches("<line ").count(), 2);
+    assert_eq!(opening.svg.matches("stroke-dasharray").count(), 0);
+
+    // A wall 0.3 m deep cuts the centre line and leaves the faces 0.2 m out.
+    set(json!({"wall_depth": 0.3})).await;
+    let thin = draw(&rw, walls_only.clone()).await;
+    assert!(!inked(&thin.pixmap, 2.8, 1.5));
+    assert!(inked(&thin.pixmap, 2.8, 1.3) && inked(&thin.pixmap, 2.8, 1.7));
+    set(json!({"wall_depth": "deep"})).await;
+    let defaulted = draw(&rw, walls_only.clone()).await;
+    assert!(!inked(&defaulted.pixmap, 2.8, 1.3) && !inked(&defaulted.pixmap, 2.8, 1.7));
+
+    // A soft deleted opening cuts nothing.
+    ok(&rw, "delete", json!({"kind": "object", "id": arch, "reason": "test"})).await;
+    let deleted = draw(&rw, plain.clone()).await;
+    assert!(changed_pixels(&before.pixmap, &deleted.pixmap).is_empty());
+
+    // Three points are not an opening: drawn as an object, and the wall
+    // stays whole.
+    let bent = ok(
+        &rw,
+        "upsert_object",
+        json!({"site_id": site, "floor_id": floor, "kind": "opening", "name": "Bent",
+               "geometry": {"type": "LineString", "coordinates": [[2.0, 1.5], [2.8, 1.5], [3.6, 1.5]]},
+               "attributes": {"opening_type": "arch"}, "reason": "test"}),
+    )
+    .await["id"]
+        .clone();
+    let drawn = draw(&rw, plain.clone()).await;
+    assert_eq!(drawn.svg.matches("<line ").count(), 0);
+    assert!(drawn.svg.contains(r#"stroke="hsl("#), "drawn as an object");
+    assert!(inked(&draw(&rw, walls_only.clone()).await.pixmap, 2.8, 1.5));
+    ok(&rw, "delete", json!({"kind": "object", "id": bent, "reason": "test"})).await;
+
+    // An opening on another floor cuts nothing on this one.
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"site_id": site, "floor_id": other_floor, "kind": "opening", "name": "Upstairs",
+               "geometry": {"type": "LineString", "coordinates": [[2.0, 1.5], [3.6, 1.5]]}, "reason": "test"}),
+    )
+    .await;
+    let elsewhere = draw(&rw, plain).await;
+    assert!(changed_pixels(&before.pixmap, &elsewhere.pixmap).is_empty());
+    assert_eq!(elsewhere.svg.matches("<line ").count(), 0);
+}
+
+/// The pixels that differ between two renders of the same size.
+fn changed_pixels(a: &Pixmap, b: &Pixmap) -> Vec<(u32, u32)> {
+    assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+    (0..a.height())
+        .flat_map(|y| (0..a.width()).map(move |x| (x, y)))
+        .filter(|&(x, y)| a.pixel(x, y) != b.pixel(x, y))
+        .collect()
+}

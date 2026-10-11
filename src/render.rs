@@ -29,6 +29,14 @@ const _: () = assert!(
 );
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
 const HIGHLIGHT: &str = "#e8590c";
+const LINEWORK_STROKE: &str = "#8a8a8a";
+const LINEWORK_WIDTH: f64 = 0.75;
+/// The dashes of an arch's curve, in pixels.
+const ARCH_DASHES: &str = "4 3";
+/// The deepest an arch's curve reaches from its chord, in metres.
+const MAX_ARCH_DEPTH: f64 = 0.4;
+/// Straight pieces in an arch's half ellipse.
+const ARCH_SEGMENTS: u32 = 24;
 
 pub struct Plan {
     pub title: String,
@@ -61,8 +69,21 @@ pub struct Label {
 
 pub enum Style {
     Linework,
-    Space { kind: String },
-    Object { kind: String },
+    Space {
+        kind: String,
+    },
+    Object {
+        kind: String,
+    },
+    /// A gap in a wall from one jamb to the other, along the wall's centre
+    /// line, in site metres. The linework is cut before it gets here; this
+    /// draws the jamb ticks, and for an arch the dashed curve across the gap.
+    Opening {
+        from: (f64, f64),
+        to: (f64, f64),
+        wall_depth: f64,
+        arch: bool,
+    },
 }
 
 pub struct Rendered {
@@ -121,13 +142,14 @@ fn svg(plan: &Plan, view: &View) -> Result<String, String> {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="Noto Sans">"##
     );
     let _ = write!(out, r#"<rect width="{w}" height="{h}" fill="white"/>"#);
-    // Linework under spaces under objects, highlights last so nothing covers
-    // them.
+    // Linework under spaces under openings under objects, highlights last so
+    // nothing covers them.
     let order = |f: &Feature| match (&f.style, f.highlight) {
-        (_, true) => 3,
+        (_, true) => 4,
         (Style::Linework, _) => 0,
         (Style::Space { .. }, _) => 1,
-        (Style::Object { .. }, _) => 2,
+        (Style::Opening { .. }, _) => 2,
+        (Style::Object { .. }, _) => 3,
     };
     let mut features: Vec<&Feature> = plan.features.iter().collect();
     features.sort_by_key(|f| order(f));
@@ -148,12 +170,24 @@ fn svg(plan: &Plan, view: &View) -> Result<String, String> {
 }
 
 fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), String> {
+    if let Style::Opening {
+        from,
+        to,
+        wall_depth,
+        arch,
+    } = feature.style
+    {
+        draw_opening(out, from, to, wall_depth, arch, feature.highlight, view);
+        return Ok(());
+    }
     let mut shapes = Shapes::new(view);
     Wkb(&feature.wkb)
         .process_geom(&mut shapes)
         .map_err(|e| format!("unreadable geometry: {e}"))?;
     let (fill, stroke, width, radius) = match (&feature.style, feature.highlight) {
-        (Style::Linework, _) => ("none".to_owned(), "#8a8a8a".to_owned(), 0.75, 2.0),
+        (Style::Linework | Style::Opening { .. }, _) => {
+            ("none".to_owned(), LINEWORK_STROKE.to_owned(), LINEWORK_WIDTH, 2.0)
+        }
         (Style::Space { kind }, false) => (space_fill(kind).to_owned(), "#555".to_owned(), 1.5, 3.0),
         (Style::Object { kind }, false) => {
             let colour = kind_colour(kind);
@@ -177,6 +211,58 @@ fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), 
         );
     }
     Ok(())
+}
+
+/// A jamb tick across the wall at each end of the opening, `wall_depth`
+/// long, and for an arch a dashed half ellipse whose chord is the opening,
+/// on the left of the line's direction, as deep as a quarter of its width
+/// up to `MAX_ARCH_DEPTH`.
+fn draw_opening(
+    out: &mut String,
+    from: (f64, f64),
+    to: (f64, f64),
+    wall_depth: f64,
+    arch: bool,
+    highlight: bool,
+    view: &View,
+) {
+    let stroke = if highlight { HIGHLIGHT } else { LINEWORK_STROKE };
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let width = dx.hypot(dy);
+    if width <= 0.0 {
+        return;
+    }
+    // Along the opening, and its left normal.
+    let (ux, uy) = (dx / width, dy / width);
+    let (nx, ny) = (-uy, ux);
+    let half = wall_depth / 2.0;
+    for (x, y) in [from, to] {
+        let (x1, y1) = view.px(x - nx * half, y - ny * half);
+        let (x2, y2) = view.px(x + nx * half, y + ny * half);
+        let _ = write!(
+            out,
+            r#"<line x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="{stroke}" stroke-width="{LINEWORK_WIDTH}"/>"#
+        );
+    }
+    if !arch {
+        return;
+    }
+    let depth = (width / 4.0).min(MAX_ARCH_DEPTH);
+    let (cx, cy) = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+    let mut path = String::new();
+    for i in 0..=ARCH_SEGMENTS {
+        // From the start of the opening at t = pi to its end at t = 0, so
+        // sin t, and the curve, stays on the left.
+        let t = std::f64::consts::PI * f64::from(ARCH_SEGMENTS - i) / f64::from(ARCH_SEGMENTS);
+        let (along, across) = (width / 2.0 * t.cos(), depth * t.sin());
+        let (px, py) = view.px(cx + ux * along + nx * across, cy + uy * along + ny * across);
+        let command = if i == 0 { 'M' } else { 'L' };
+        let _ = write!(path, "{command}{px:.2} {py:.2} ");
+    }
+    let _ = write!(
+        out,
+        r#"<path d="{path}" fill="none" stroke="{stroke}" stroke-width="{LINEWORK_WIDTH}" stroke-dasharray="{ARCH_DASHES}"/>"#
+    );
 }
 
 /// Draws every label in a group that clips them out of the square the north

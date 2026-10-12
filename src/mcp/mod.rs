@@ -4,6 +4,13 @@
 //! two importers in `import` and the plan renderer in `plan`. A write tool is one in the write
 //! router; the handler refuses those to a read only caller before they run,
 //! and hides them from that caller's tool list.
+//!
+//! Every read of a floor, space or object goes through the `live_floor`,
+//! `live_space` and `live_object` views, which leave out a row whose site or
+//! floor is deleted as well as one deleted itself. Writes use the tables.
+
+#[macro_use]
+mod sql;
 
 mod connections;
 mod import;

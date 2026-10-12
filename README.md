@@ -13,7 +13,7 @@ Each site has its own frame: metres, x east, y north, z up, with an origin chose
 | `site` | name, optional origin and rotation, attributes |
 | `floor` | site, name, level, elevation, ceiling height, attributes |
 | `space` | site, floor (null outdoors), name, kind (`room`, `terrace`, `garden_bed`, `pool`, `parcel`, `building`), polygon, wall material, attributes |
-| `object` | site, floor (null outdoors), kind (`light`, `switch`, `socket`, `access_point`, `camera`, `sensor`, `speaker`, `tree`, `pipe`, `cable_run`, `opening` or any other lowercase word), name, point, line or polygon, height above the floor, outside identifiers in `refs`, attributes |
+| `object` | site, floor (null outdoors), kind (`light`, `switch`, `socket`, `access_point`, `camera`, `sensor`, `speaker`, `tree`, `pipe`, `cable_run`, `opening` or any other lowercase word), name, point, line or polygon, `placement` (`exact`, `approximate` or `unplaced`), height above the floor, outside identifiers in `refs`, attributes |
 | `linework` | CAD geometry as drawn, by import and layer, for rendering; on a floor, or on the site with no floor |
 | `dxf_import` | one row per import of a drawing onto a floor, or onto a site with no floor |
 | `file` | name, media type, size, sha256, optional links to a site, floor, space or object |
@@ -21,6 +21,8 @@ Each site has its own frame: metres, x east, y north, z up, with an origin chose
 | `change` | every insert, update and delete on the tables above |
 
 The server never removes a row. A delete sets `deleted_at`, and `restore` clears it.
+
+Every read goes through three views, `live_floor`, `live_space` and `live_object`, which are the one definition of live: a row that is not deleted, on a site that is not deleted, and on a floor that is not deleted when it has one. Deleting a site or floor marks only that row, so every read tool stops returning what it holds at once, and restoring it brings all of it back as it was; `delete` reports how many floors, spaces and objects it hid. Writes use the tables. The views are granted to `house_qgis` and `house_ro` too, for QGIS layers that should show only what the server shows.
 
 ### The change log
 
@@ -34,7 +36,7 @@ Triggers on every model table write a `change` row for each insert, update and d
 | `house_qgis` | select, insert, update and delete on `site`, `floor`, `space`, `object` and `note`; select on everything else; never write `change` |
 | `house_ro` | select on everything |
 
-The migrations grant to `house_qgis` and `house_ro` but do not create them, because the owning role cannot create roles. Both must exist before the server first starts, and the database needs the `postgis` extension, which only a superuser can create.
+The migrations grant to `house_qgis` and `house_ro` but do not create them, because the owning role cannot create roles. Both must exist before the server first starts, and the database needs the `postgis` extension, which only a superuser can create. The migrations create `unaccent` themselves: it is a trusted extension, which the owning role may create.
 
 ## Tools
 
@@ -46,10 +48,10 @@ Read tools, available to both tokens:
 | --- | --- |
 | `list_sites` | live sites with their attributes, floors (with theirs) and georeference |
 | `get_floor` | a floor with its attributes, spaces and objects as GeoJSON |
-| `find` | spaces and objects by part of a name, kind, outside identifier or attribute |
-| `what_is_at` | the spaces containing a point, and the objects within a radius; with `floor_id`, outdoors and that floor, without it outdoors and every floor, each hit naming its floor |
-| `in_space` | the objects and smaller spaces inside a space |
-| `nearest` | the n objects of a kind nearest a point, space or object, in plan |
+| `find` | spaces and objects by any name they go by, kind, outside identifier or attribute, best match first; see [Finding things](#finding-things) |
+| `what_is_at` | the spaces containing a point, and the placed objects within a radius; with `floor_id`, outdoors and that floor, without it outdoors and every floor, each hit naming its floor |
+| `in_space` | the placed objects and smaller spaces inside a space |
+| `nearest` | the n placed objects of a kind nearest a point, space or object, in plan |
 | `measure` | area, perimeter and length, and the distance between two things |
 | `connections` | the openings that touch a space and the space beyond each, or the shortest way between two spaces through openings |
 | `list_files` | files, optionally by what they are linked to |
@@ -72,7 +74,21 @@ Write tools take a required `reason`. They are refused to the read only token an
 | `upload_file` | text inline, or binary as base64 up to 25 MiB |
 | `import_geojson` | features in any EPSG system as spaces or objects, converted into the site frame |
 | `import_dxf` | a stored DXF drawing onto a floor, or onto the site with no floor |
-| `delete`, `restore` | mark a row deleted, or bring it back |
+| `delete`, `restore` | mark a row deleted, or bring it back; a site or floor hides or brings back all it holds |
+
+### Finding things
+
+`find` with `name` matches part of any name a thing goes by: the stored `name`, the attributes `common_name`, `name_en`, `label` and `nickname`, every string in a `nicknames` list, and every outside identifier in `refs`, such as `ha_name`. Case and accents do not matter, and a leading `the `, `il ` or `la ` is ignored on either side, so `snug` finds a room whose `common_name` is `the snug` and `citta` finds `Città`. Hits are ranked: an exact match on any field, then one that starts with the query, then one that contains it, with ties by name, and `limit` applies after ranking. Each hit names the field that matched in `matched_on`.
+
+`find`, `in_space` and `nearest` return short hits unless asked for `detail: true`: `id`, `kind`, `name`, `site_id`, `floor_id`, `area` for a space, and `placement` and `in_space` for an object. `in_space` is the smallest live space on the object's floor that covers its position (the midpoint of a line, the centroid of anything else). With `detail: true` a hit also carries its attributes, outside identifiers and geometry. `what_is_at` and `connections` never return geometry.
+
+### Placement
+
+An object's `placement` says how its geometry was found: `exact`, where it is; `approximate`, near where it is, such as the middle of its room; or `unplaced`, not known at all, with a stand in geometry because `geom` may not be null. `upsert_object` takes `placement`, `exact` by default on create. On update a `placement` left out keeps the stored one, even when new geometry is given, so moving an unplaced object to where it really is takes `"placement": "exact"` too.
+
+`nearest`, `what_is_at` and `in_space` leave unplaced objects out and count them in `unplaced_omitted`, and every object they return carries `placement`; `nearest` ranks an approximate object like any other, and a distance to it is only as good as its room. `measure` and `nearest` refuse to measure from an unplaced object. `render_plan` does not draw unplaced objects and lists them in the legend as "N items not placed"; it draws approximate ones hollow, keyed in the legend as "position approximate". `find` returns unplaced objects like any other, so they can be found and placed.
+
+Migration 0004 filled `placement` from the `position` attribute that seeded objects carried: `site_unplaced` became `unplaced`, and any other value, such as `room_centre`, `approximate`. The attribute was left as it was, and the migration logs how many objects had each value.
 
 ### Updating part of a row
 

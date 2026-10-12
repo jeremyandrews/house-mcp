@@ -222,8 +222,8 @@ async fn end_to_end() {
         json!({"site_id": site, "kind": "light", "from": {"point": [8.0, 1.0]}}),
     )
     .await;
-    assert_eq!(nearest[0]["id"], light);
-    let distance = nearest[0]["distance"].as_f64().expect("distance");
+    assert_eq!(nearest["objects"][0]["id"], light);
+    let distance = nearest["objects"][0]["distance"].as_f64().expect("distance");
     assert!((distance - 6.0_f64.hypot(1.5)).abs() < 1e-9, "{distance}");
 
     let kitchen = import["spaces"]
@@ -390,7 +390,7 @@ async fn end_to_end() {
         json!({"site_id": site, "kind": "light", "from": {"point": [8.0, 1.0]}}),
     )
     .await;
-    assert_eq!(nearest, json!([]));
+    assert_eq!(nearest["objects"], json!([]));
     ok(&rw, "restore", json!({"kind": "object", "id": light, "reason": "test"})).await;
     let nearest = ok(
         &ro,
@@ -398,7 +398,7 @@ async fn end_to_end() {
         json!({"site_id": site, "kind": "light", "from": {"point": [8.0, 1.0]}}),
     )
     .await;
-    assert_eq!(nearest[0]["id"], light);
+    assert_eq!(nearest["objects"][0]["id"], light);
 
     // A DWG is kept but not read.
     let dwg = ok(
@@ -1051,7 +1051,7 @@ async fn nearest_and_what_is_at_list_the_nearest_first() {
         json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
     )
     .await;
-    assert_eq!(column(&found, "id"), nearest_first);
+    assert_eq!(column(&found["objects"], "id"), nearest_first);
     let at = ok(
         &rw,
         "what_is_at",
@@ -2150,4 +2150,472 @@ async fn upsert_floor_takes_a_real_floors_payload() {
     while let Some(result) = calls.join_next().await {
         result.expect("a task").expect("upsert_floor");
     }
+}
+
+/// A point geometry.
+fn point(x: f64, y: f64) -> Value {
+    json!({"type": "Point", "coordinates": [x, y]})
+}
+
+/// Creates an object and returns its id.
+async fn object(rw: &RunningService<RoleClient, ()>, mut args: Value) -> i64 {
+    args["reason"] = json!("test");
+    id_of(ok(rw, "upsert_object", args).await).await
+}
+
+/// Creates a space and returns its id.
+async fn space(rw: &RunningService<RoleClient, ()>, mut args: Value) -> i64 {
+    args["reason"] = json!("test");
+    id_of(ok(rw, "upsert_space", args).await).await
+}
+
+#[tokio::test]
+async fn a_deleted_site_or_floor_hides_everything_it_holds() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let ro = client(&server, RO).await;
+    let (site, floor) = site_and_floor(&rw, "Hidden").await;
+    let room = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Hidden room", "geometry": ring(0.0, 0.0, 4.0, 3.0)}),
+    )
+    .await;
+    let hall = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Hidden hall", "geometry": ring(4.0, 0.0, 2.0, 3.0)}),
+    )
+    .await;
+    let lamp = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "light", "name": "Hidden lamp", "geometry": point(1.0, 1.0)}),
+    )
+    .await;
+    object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "opening", "name": "Hidden door",
+               "geometry": {"type": "LineString", "coordinates": [[4.0, 1.0], [4.0, 2.0]]}, "attributes": {"connects": [room, hall]}}),
+    )
+    .await;
+    let garden = space(
+        &rw,
+        json!({"site_id": site, "kind": "garden_bed", "name": "Hidden bed", "geometry": ring(0.0, 10.0, 2.0, 2.0)}),
+    )
+    .await;
+    let tree = object(
+        &rw,
+        json!({"site_id": site, "kind": "tree", "name": "Hidden tree", "geometry": point(1.0, 11.0)}),
+    )
+    .await;
+
+    // Everything the read tools can reach, as (what, visible).
+    async fn visible(
+        ro: &RunningService<RoleClient, ()>,
+        site: i64,
+        floor: i64,
+        room: i64,
+        lamp: i64,
+    ) -> Vec<(&'static str, bool)> {
+        let found = ok(ro, "find", json!({"name": "hidden"})).await;
+        let at = ok(
+            ro,
+            "what_is_at",
+            json!({"site_id": site, "x": 1.0, "y": 1.0, "radius": 1.0}),
+        )
+        .await;
+        let outdoors = ok(
+            ro,
+            "what_is_at",
+            json!({"site_id": site, "x": 1.0, "y": 11.0, "radius": 1.0}),
+        )
+        .await;
+        let nearest = ok(
+            ro,
+            "nearest",
+            json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
+        )
+        .await;
+        let sites = ok(ro, "list_sites", json!({})).await;
+        vec![
+            ("find spaces", !found["spaces"].as_array().expect("spaces").is_empty()),
+            (
+                "find objects",
+                !found["objects"].as_array().expect("objects").is_empty(),
+            ),
+            (
+                "what_is_at spaces",
+                !at["spaces"].as_array().expect("spaces").is_empty(),
+            ),
+            (
+                "what_is_at objects",
+                !at["objects"].as_array().expect("objects").is_empty(),
+            ),
+            (
+                "what_is_at outdoors",
+                !outdoors["objects"].as_array().expect("objects").is_empty(),
+            ),
+            ("nearest", !nearest["objects"].as_array().expect("objects").is_empty()),
+            (
+                "in_space",
+                call(ro, "in_space", json!({"space_id": room})).await.is_ok(),
+            ),
+            (
+                "measure space",
+                call(ro, "measure", json!({"a": {"space": room}})).await.is_ok(),
+            ),
+            (
+                "measure object",
+                call(ro, "measure", json!({"a": {"object": lamp}})).await.is_ok(),
+            ),
+            (
+                "connections",
+                call(ro, "connections", json!({"space_id": room})).await.is_ok(),
+            ),
+            (
+                "get_floor",
+                call(ro, "get_floor", json!({"floor_id": floor})).await.is_ok(),
+            ),
+            (
+                "render_plan",
+                call(ro, "render_plan", json!({"site_id": site, "floor_id": floor}))
+                    .await
+                    .is_ok(),
+            ),
+            ("list_sites", !sites.as_array().expect("sites").is_empty()),
+        ]
+    }
+    let all = |seen: Vec<(&'static str, bool)>, expected: bool| {
+        for (what, shown) in seen {
+            assert_eq!(shown, expected, "{what}");
+        }
+    };
+    all(visible(&ro, site, floor, room, lamp).await, true);
+
+    // Deleting the site marks only the site, and hides all it holds.
+    let deleted = ok(&rw, "delete", json!({"kind": "site", "id": site, "reason": "test"})).await;
+    assert_eq!(deleted["hides"], json!({"floors": 1, "spaces": 3, "objects": 3}));
+    all(visible(&ro, site, floor, room, lamp).await, false);
+    let history = ok(&ro, "history", json!({"kind": "space", "id": room})).await;
+    assert_eq!(
+        history.as_array().expect("history").len(),
+        1,
+        "the room was not written"
+    );
+
+    // Restoring it brings everything back as it was.
+    ok(&rw, "restore", json!({"kind": "site", "id": site, "reason": "test"})).await;
+    all(visible(&ro, site, floor, room, lamp).await, true);
+
+    // A deleted floor hides its spaces and objects, but not the outdoor ones.
+    let deleted = ok(&rw, "delete", json!({"kind": "floor", "id": floor, "reason": "test"})).await;
+    assert_eq!(deleted["hides"], json!({"floors": 1, "spaces": 2, "objects": 2}));
+    let found = ok(&ro, "find", json!({"name": "hidden"})).await;
+    assert_eq!(column(&found["spaces"], "id"), [json!(garden)]);
+    assert_eq!(column(&found["objects"], "id"), [json!(tree)]);
+    let at = ok(
+        &ro,
+        "what_is_at",
+        json!({"site_id": site, "x": 1.0, "y": 1.0, "radius": 1.0}),
+    )
+    .await;
+    assert_eq!((at["spaces"].clone(), at["objects"].clone()), (json!([]), json!([])));
+    assert!(call(&ro, "in_space", json!({"space_id": room})).await.is_err());
+    assert!(call(&ro, "connections", json!({"space_id": room})).await.is_err());
+    let nearest = ok(
+        &ro,
+        "nearest",
+        json!({"site_id": site, "kind": "light", "from": {"point": [0.0, 0.0]}}),
+    )
+    .await;
+    assert_eq!(nearest["objects"], json!([]));
+    ok(&rw, "restore", json!({"kind": "floor", "id": floor, "reason": "test"})).await;
+    all(visible(&ro, site, floor, room, lamp).await, true);
+
+    // A row deleted on its own stays deleted when its site comes back.
+    ok(&rw, "delete", json!({"kind": "object", "id": lamp, "reason": "test"})).await;
+    ok(&rw, "delete", json!({"kind": "site", "id": site, "reason": "test"})).await;
+    ok(&rw, "restore", json!({"kind": "site", "id": site, "reason": "test"})).await;
+    let found = ok(&ro, "find", json!({"name": "hidden lamp"})).await;
+    assert_eq!(found["objects"], json!([]));
+}
+
+#[tokio::test]
+async fn find_matches_every_name_and_ranks_the_best_first() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let ro = client(&server, RO).await;
+    let (site, floor) = site_and_floor(&rw, "Names").await;
+    let cambusa = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Cambusa", "geometry": ring(0.0, 0.0, 6.0, 4.0),
+               "attributes": {"common_name": "the scullery"}}),
+    )
+    .await;
+    let stiva = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Stiva", "geometry": ring(4.0, 0.0, 2.0, 2.0)}),
+    )
+    .await;
+    let snug = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Salottino", "geometry": ring(6.0, 0.0, 5.0, 4.0),
+               "attributes": {"nicknames": ["snug", 3, "den"]}}),
+    )
+    .await;
+    let zaffiro = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Sala Zàffiro", "geometry": ring(11.0, 0.0, 2.0, 4.0)}),
+    )
+    .await;
+    // Made so that neither id nor name order gives the ranked order: a
+    // contains match, a prefix match on an outside identifier, and an exact
+    // match on a nickname.
+    let contains = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "light", "name": "A scullery lamp", "geometry": point(1.0, 1.0)}),
+    )
+    .await;
+    let prefix = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "camera", "name": "Mid cam", "geometry": point(5.0, 1.0),
+               "refs": {"ha_name": "Scullery Camera"}}),
+    )
+    .await;
+    let exact = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "sensor", "name": "Zed", "geometry":
+               {"type": "LineString", "coordinates": [[0.5, 3.0], [2.5, 3.0]]}, "attributes": {"nicknames": ["Scullery"]}}),
+    )
+    .await;
+
+    let found = ok(&ro, "find", json!({"name": "scullery"})).await;
+    assert_eq!(column(&found["spaces"], "id"), [json!(cambusa)]);
+    assert_eq!(found["spaces"][0]["matched_on"], "common_name");
+    assert_eq!(
+        column(&found["objects"], "id"),
+        [json!(exact), json!(prefix), json!(contains)]
+    );
+    assert_eq!(
+        column(&found["objects"], "matched_on"),
+        [json!("nicknames"), json!("refs.ha_name"), json!("name")]
+    );
+    // The limit applies after ranking.
+    let found = ok(&ro, "find", json!({"name": "scullery", "limit": 1})).await;
+    assert_eq!(column(&found["objects"], "id"), [json!(exact)]);
+    // Through a nickname list, with an article in the query.
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "The Den"})).await;
+    assert_eq!(column(&found["spaces"], "id"), [json!(snug)]);
+    assert_eq!(found["spaces"][0]["matched_on"], "nicknames");
+    // Without the accent, and with one where the stored name has none.
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "zaffiro"})).await;
+    assert_eq!(column(&found["spaces"], "id"), [json!(zaffiro)]);
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "CAMBÙSA"})).await;
+    assert_eq!(column(&found["spaces"], "id"), [json!(cambusa)]);
+    assert_eq!(found["spaces"][0]["matched_on"], "name");
+    // An outside identifier matches anywhere in it.
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "camera"})).await;
+    assert_eq!(column(&found["objects"], "id"), [json!(prefix)]);
+    // Nothing that does not match.
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "garage"})).await;
+    assert_eq!(
+        (found["spaces"].clone(), found["objects"].clone()),
+        (json!([]), json!([]))
+    );
+
+    // Short hits carry no geometry, attributes or refs; in_space names the
+    // smallest room covering the position, the midpoint for a line.
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "scullery"})).await;
+    for hit in found["spaces"]
+        .as_array()
+        .into_iter()
+        .chain(found["objects"].as_array())
+        .flatten()
+    {
+        for key in ["geometry", "attributes", "refs"] {
+            assert!(hit.get(key).is_none(), "{key} in {hit}");
+        }
+    }
+    let by_id = |id: i64| {
+        found["objects"]
+            .as_array()
+            .expect("objects")
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .expect("hit")
+    };
+    assert_eq!(by_id(prefix)["in_space"], json!({"id": stiva, "name": "Stiva"}));
+    assert_eq!(by_id(contains)["in_space"], json!({"id": cambusa, "name": "Cambusa"}));
+    assert_eq!(by_id(exact)["in_space"]["id"], cambusa);
+    assert_eq!(by_id(exact)["placement"], "exact");
+    assert_eq!(found["spaces"][0]["area"], 24.0);
+    // With detail, the geometry and the rest come too.
+    let detailed = ok(
+        &ro,
+        "find",
+        json!({"site_id": site, "name": "scullery", "detail": true}),
+    )
+    .await;
+    assert_eq!(detailed["objects"][0]["geometry"]["type"], "LineString");
+    assert_eq!(detailed["objects"][0]["attributes"]["nicknames"], json!(["Scullery"]));
+    assert_eq!(detailed["objects"][0]["matched_on"], "nicknames");
+    assert_eq!(detailed["spaces"][0]["geometry"]["type"], "Polygon");
+    assert_eq!(detailed["spaces"][0]["matched_on"], "common_name");
+
+    // in_space and nearest are short too unless asked.
+    let inside = ok(&ro, "in_space", json!({"space_id": cambusa})).await;
+    assert!(inside["objects"][0].get("geometry").is_none());
+    let inside = ok(&ro, "in_space", json!({"space_id": cambusa, "detail": true})).await;
+    assert!(inside["objects"][0].get("geometry").is_some());
+    let nearest = ok(
+        &ro,
+        "nearest",
+        json!({"site_id": site, "kind": "camera", "from": {"space": cambusa}}),
+    )
+    .await;
+    assert!(nearest["objects"][0].get("geometry").is_none());
+    assert_eq!(nearest["objects"][0]["in_space"]["id"], stiva);
+    let nearest = ok(
+        &ro,
+        "nearest",
+        json!({"site_id": site, "kind": "camera", "from": {"space": cambusa}, "detail": true}),
+    )
+    .await;
+    assert!(nearest["objects"][0].get("geometry").is_some());
+
+    // An empty name is refused rather than matching everything.
+    let refused = call(&ro, "find", json!({"name": "  "})).await.expect_err("refused");
+    assert!(refused.contains("name: is empty"), "{refused}");
+}
+
+#[tokio::test]
+async fn unplaced_objects_are_left_out_and_approximate_ones_marked() {
+    let server = start().await;
+    let rw = client(&server, RW).await;
+    let ro = client(&server, RO).await;
+    let (site, floor) = site_and_floor(&rw, "Placement").await;
+    let room = space(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "room", "name": "Study", "geometry": ring(0.0, 0.0, 4.0, 4.0)}),
+    )
+    .await;
+    let exact = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "camera", "name": "Measured", "geometry": point(1.0, 1.0)}),
+    )
+    .await;
+    let approximate = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "camera", "name": "Middle of the room", "geometry": point(2.0, 2.0),
+               "placement": "approximate"}),
+    )
+    .await;
+    // Its stand in position is in the room, nearer than either.
+    let unplaced = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "camera", "name": "Somewhere", "geometry": point(2.1, 2.1),
+               "placement": "unplaced"}),
+    )
+    .await;
+
+    let nearest = ok(
+        &ro,
+        "nearest",
+        json!({"site_id": site, "kind": "camera", "from": {"point": [2.1, 2.1]}}),
+    )
+    .await;
+    assert_eq!(column(&nearest["objects"], "id"), [json!(approximate), json!(exact)]);
+    assert_eq!(
+        column(&nearest["objects"], "placement"),
+        [json!("approximate"), json!("exact")]
+    );
+    assert_eq!(nearest["unplaced_omitted"], 1);
+    let at = ok(
+        &ro,
+        "what_is_at",
+        json!({"site_id": site, "x": 2.1, "y": 2.1, "radius": 5.0}),
+    )
+    .await;
+    assert_eq!(column(&at["objects"], "id"), [json!(approximate), json!(exact)]);
+    assert_eq!(
+        column(&at["objects"], "placement"),
+        [json!("approximate"), json!("exact")]
+    );
+    assert_eq!(at["unplaced_omitted"], 1);
+    let inside = ok(&ro, "in_space", json!({"space_id": room})).await;
+    let mut ids = column(&inside["objects"], "id");
+    ids.sort_by_key(|id| id.as_i64());
+    assert_eq!(ids, [json!(exact), json!(approximate)]);
+    assert_eq!(inside["unplaced_omitted"], 1);
+    for hit in inside["objects"].as_array().expect("objects") {
+        assert!(hit["placement"].is_string(), "{hit}");
+    }
+    // find still returns it, so that it can be placed.
+    let found = ok(&ro, "find", json!({"site_id": site, "name": "somewhere"})).await;
+    assert_eq!(found["objects"][0]["placement"], "unplaced");
+    assert_eq!(found["objects"][0]["in_space"], Value::Null);
+    // Nothing is measured from where it is not known to be.
+    let refused = call(
+        &ro,
+        "nearest",
+        json!({"site_id": site, "kind": "camera", "from": {"object": unplaced}}),
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.contains("unplaced"), "{refused}");
+
+    // The plan leaves it out and says so, and draws the approximate one
+    // hollow with a key in the legend.
+    let summary = ok(&ro, "render_plan", json!({"site_id": site, "floor_id": floor})).await;
+    assert_eq!(summary["not_placed"], 1);
+    assert_eq!(summary["notes"], json!(["position approximate", "1 item not placed"]));
+    let drawn = draw(&ro, json!({"site_id": site, "floor_id": floor, "label_from": []})).await;
+    assert_eq!(drawn.svg.matches(r#"<circle class="approximate" "#).count(), 1);
+    assert!(drawn.svg.contains(">1 item not placed</text>"), "count in the legend");
+    assert!(drawn.svg.contains(">position approximate</text>"), "key in the legend");
+    assert!(!drawn.svg.contains(">Somewhere</text>"), "unplaced not labelled");
+    assert!(drawn.svg.contains(">Measured</text>"));
+
+    // An update without placement keeps it, even with new geometry.
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"id": unplaced, "site_id": site, "geometry": point(3.0, 3.0), "reason": "test"}),
+    )
+    .await;
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"id": approximate, "site_id": site, "name": "Middle camera", "reason": "test"}),
+    )
+    .await;
+    let found = ok(&ro, "find", json!({"site_id": site, "kind": "camera"})).await;
+    let placements: Vec<(Value, Value)> = found["objects"]
+        .as_array()
+        .expect("objects")
+        .iter()
+        .map(|o| (o["id"].clone(), o["placement"].clone()))
+        .collect();
+    assert!(
+        placements.contains(&(json!(unplaced), json!("unplaced"))),
+        "{placements:?}"
+    );
+    assert!(
+        placements.contains(&(json!(approximate), json!("approximate"))),
+        "{placements:?}"
+    );
+    // Given, it changes.
+    ok(
+        &rw,
+        "upsert_object",
+        json!({"id": unplaced, "site_id": site, "placement": "exact", "reason": "found it"}),
+    )
+    .await;
+    let nearest = ok(
+        &ro,
+        "nearest",
+        json!({"site_id": site, "kind": "camera", "from": {"point": [3.0, 3.0]}}),
+    )
+    .await;
+    assert_eq!(nearest["objects"][0]["id"], unplaced);
+    assert_eq!(nearest["unplaced_omitted"], 0);
 }

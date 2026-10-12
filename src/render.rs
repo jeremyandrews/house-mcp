@@ -38,6 +38,10 @@ const LINEWORK_STROKE: &str = "#8a8a8a";
 const LINEWORK_WIDTH: f64 = 0.75;
 /// The dashes of an arch's face lines, in pixels.
 const ARCH_DASHES: &str = "4 3";
+/// The dashes of an approximate object's outline, in pixels.
+const APPROXIMATE_DASHES: &str = "3 3";
+/// The legend line that keys the hollow style.
+pub const APPROXIMATE_NOTE: &str = "position approximate";
 /// A door leaf is drawn heavier than the wall lines, its swing lighter.
 const DOOR_LEAF_WIDTH: f64 = 1.5;
 const DOOR_SWING_WIDTH: f64 = 0.5;
@@ -63,6 +67,9 @@ pub struct Plan {
     pub extent: Extent,
     pub features: Vec<Feature>,
     pub label_size: LabelSize,
+    /// Objects left off the plan because their position is not known. When
+    /// there are any, the legend says how many.
+    pub not_placed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,6 +121,9 @@ pub enum Style {
     },
     Object {
         kind: String,
+        /// Placed only near where it is, such as the middle of its room:
+        /// drawn hollow, and named in the legend.
+        approximate: bool,
     },
     /// A gap in a wall from one jamb to the other, along the wall's centre
     /// line, in site metres. The linework is cut before it gets here; this
@@ -152,6 +162,9 @@ pub struct Rendered {
     /// Labels with no room to stand by their feature, in the order of their
     /// numbered markers: entry `i` is marker `i + 1`.
     pub legend: Vec<String>,
+    /// The legend's lines that are not labels: how many objects were not
+    /// placed, and the key to the approximate style.
+    pub notes: Vec<String>,
 }
 
 /// Site metres to pixels, y flipped so north is up.
@@ -215,11 +228,12 @@ pub fn render(plan: &Plan, long_side_px: u32) -> Result<Rendered, String> {
     // labels. The footer only grows, and no further than every label in the
     // legend needs, so this ends.
     let extent = with_door_swings(plan.extent, &plan.features);
+    let notes = notes(plan);
     let mut footer = FOOTER;
     let (view, labels, legend) = loop {
         let view = View::new(extent, long_side, footer);
         let labels = place_labels(&features, &view, factor, &font)?;
-        let legend = Legend::lay_out(&labels, &view, &plan.title, factor, &font);
+        let legend = Legend::lay_out(&labels, &notes, &view, &plan.title, factor, &font);
         if legend.footer <= footer {
             break (view, labels, legend);
         }
@@ -232,7 +246,13 @@ pub fn render(plan: &Plan, long_side_px: u32) -> Result<Rendered, String> {
         png,
         width: view.width.round() as u32,
         height: view.height.round() as u32,
-        legend: legend.entries.into_iter().map(|e| e.text).collect(),
+        legend: legend
+            .entries
+            .into_iter()
+            .filter(|e| matches!(e.key, Key::Number(_)))
+            .map(|e| e.text)
+            .collect(),
+        notes: notes.into_iter().map(|(_, text)| text).collect(),
     })
 }
 
@@ -287,26 +307,46 @@ fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), 
             ("none".to_owned(), LINEWORK_STROKE.to_owned(), LINEWORK_WIDTH, 2.0)
         }
         (Style::Space { kind }, false) => (space_fill(kind).to_owned(), "#555".to_owned(), 1.5, 3.0),
-        (Style::Object { kind }, false) => {
+        (Style::Object { kind, .. }, false) => {
             let colour = kind_colour(kind);
             (colour.clone(), colour, 2.5, 6.0)
         }
         (Style::Space { .. }, true) => ("none".to_owned(), HIGHLIGHT.to_owned(), 4.0, 6.0),
         (Style::Object { .. }, true) => (HIGHLIGHT.to_owned(), HIGHLIGHT.to_owned(), 4.0, 9.0),
     };
+    // An approximate object is drawn hollow: an outline with no fill, and a
+    // dashed line, so it does not pass for a measured position.
+    let hollow = !feature.highlight && matches!(feature.style, Style::Object { approximate: true, .. });
     if !shapes.path.is_empty() {
-        let area_fill = if shapes.rings.is_empty() { "none" } else { fill.as_str() };
+        let area_fill = if shapes.rings.is_empty() || hollow {
+            "none"
+        } else {
+            fill.as_str()
+        };
+        let dashes = if hollow {
+            format!(r#" stroke-dasharray="{APPROXIMATE_DASHES}""#)
+        } else {
+            String::new()
+        };
         let _ = write!(
             out,
-            r##"<path d="{}" fill="{area_fill}" fill-opacity="0.6" fill-rule="evenodd" stroke="{stroke}" stroke-width="{width}" stroke-linejoin="round"/>"##,
+            r##"<path d="{}" fill="{area_fill}" fill-opacity="0.6" fill-rule="evenodd" stroke="{stroke}" stroke-width="{width}"{dashes} stroke-linejoin="round"/>"##,
             shapes.path
         );
     }
     for (x, y) in shapes.points {
-        let _ = write!(
-            out,
-            r##"<circle cx="{x:.2}" cy="{y:.2}" r="{radius}" fill="{fill}" stroke="white" stroke-width="1.5"/>"##
-        );
+        if hollow {
+            let _ = write!(
+                out,
+                r##"<circle class="approximate" cx="{x:.2}" cy="{y:.2}" r="{:.2}" fill="white" stroke="{fill}" stroke-width="2"/>"##,
+                radius - 1.0
+            );
+        } else {
+            let _ = write!(
+                out,
+                r##"<circle cx="{x:.2}" cy="{y:.2}" r="{radius}" fill="{fill}" stroke="white" stroke-width="1.5"/>"##
+            );
+        }
     }
     Ok(())
 }
@@ -785,9 +825,39 @@ fn draw_placed(out: &mut String, placed: &Placed, factor: f64) {
     }
 }
 
-/// One numbered line of the legend.
+/// What stands left of a legend line's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    /// The number of a label's marker.
+    Number(usize),
+    /// A sample of the hollow style approximate objects are drawn in.
+    Approximate,
+    /// Nothing: a line of text alone.
+    Blank,
+}
+
+/// The legend's lines that are not labels: how many objects are missing
+/// from the plan, and the key to the approximate style when one is drawn.
+fn notes(plan: &Plan) -> Vec<(Key, String)> {
+    let mut notes = Vec::new();
+    if plan
+        .features
+        .iter()
+        .any(|f| matches!(f.style, Style::Object { approximate: true, .. }))
+    {
+        notes.push((Key::Approximate, APPROXIMATE_NOTE.to_owned()));
+    }
+    match plan.not_placed {
+        0 => {}
+        1 => notes.push((Key::Blank, "1 item not placed".to_owned())),
+        n => notes.push((Key::Blank, format!("{n} items not placed"))),
+    }
+    notes
+}
+
+/// One line of the legend: a label that became a numbered marker, or a note.
 struct Entry {
-    number: usize,
+    key: Key,
     text: String,
     /// The text broken to fit when the image is narrow, else one line.
     lines: Vec<String>,
@@ -808,19 +878,31 @@ struct Legend {
 }
 
 impl Legend {
-    fn lay_out(labels: &[Placed], view: &View, title: &str, factor: f64, font: &Measure) -> Self {
+    fn lay_out(
+        labels: &[Placed],
+        notes: &[(Key, String)],
+        view: &View,
+        title: &str,
+        factor: f64,
+        font: &Measure,
+    ) -> Self {
         let size = LEGEND_FONT * factor;
         let line = 1.3 * size;
         let mut entries: Vec<Entry> = labels
             .iter()
             .filter_map(|p| match p.spot {
                 Spot::Marker { number, .. } => Some(Entry {
-                    number,
+                    key: Key::Number(number),
                     text: p.text.clone(),
                     lines: vec![p.text.clone()],
                 }),
                 Spot::Text { .. } => None,
             })
+            .chain(notes.iter().map(|(key, text)| Entry {
+                key: *key,
+                text: text.clone(),
+                lines: vec![text.clone()],
+            }))
             .collect();
         let mut legend = Self {
             footer: FOOTER,
@@ -891,11 +973,25 @@ impl Legend {
                 (self.x, y)
             };
             let text_x = x + 2.0 * self.size;
-            let _ = write!(
-                out,
-                r##"<text x="{x:.2}" y="{entry_y:.2}" font-size="{:.2}" font-weight="bold" fill="#111">{}</text>"##,
-                self.size, entry.number
-            );
+            match entry.key {
+                Key::Number(number) => {
+                    let _ = write!(
+                        out,
+                        r##"<text x="{x:.2}" y="{entry_y:.2}" font-size="{:.2}" font-weight="bold" fill="#111">{number}</text>"##,
+                        self.size
+                    );
+                }
+                Key::Approximate => {
+                    let _ = write!(
+                        out,
+                        r##"<circle class="approximate-key" cx="{:.2}" cy="{:.2}" r="{:.2}" fill="white" stroke="#555" stroke-width="2"/>"##,
+                        x + 0.5 * self.size,
+                        entry_y - 0.35 * self.size,
+                        0.35 * self.size
+                    );
+                }
+                Key::Blank => {}
+            }
             if entry.lines.len() == 1 {
                 let _ = write!(
                     out,
@@ -1225,7 +1321,10 @@ mod tests {
             let (x, y) = (8.3 + 0.15 * f64::from(i), 0.5 + 0.05 * f64::from(i));
             features.push(Feature {
                 wkb: point(x, y),
-                style: Style::Object { kind: "lamp".into() },
+                style: Style::Object {
+                    kind: "lamp".into(),
+                    approximate: false,
+                },
                 label: Some(Label {
                     text: format!("Reading lamp {i}"),
                     x,

@@ -222,8 +222,10 @@ impl House {
     }
 }
 
+/// A tool's JSON reply, without indentation: a calling agent pays for every
+/// byte, and whitespace is a large share of a pretty printed reply.
 fn json_result(value: impl Serialize) -> Result<CallToolResult, ErrorData> {
-    let text = serde_json::to_string_pretty(&value).map_err(|e| error::internal("encoding a result", e))?;
+    let text = serde_json::to_string(&value).map_err(|e| error::internal("encoding a result", e))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 

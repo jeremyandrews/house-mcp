@@ -2462,10 +2462,31 @@ async fn find_matches_every_name_and_ranks_the_best_first() {
     assert_eq!(detailed["spaces"][0]["matched_on"], "common_name");
 
     // in_space and nearest are short too unless asked.
+    let cable = object(
+        &rw,
+        json!({"site_id": site, "floor_id": floor, "kind": "cable_run", "name": "Cable",
+               "geometry": {"type": "LineString", "coordinates": [[5.0, 3.0], [7.0, 3.0]]}}),
+    )
+    .await;
     let inside = ok(&ro, "in_space", json!({"space_id": cambusa})).await;
     assert!(inside["objects"][0].get("geometry").is_none());
+    // Only what crosses the edge says so; a short reply has no wholly_inside.
+    for hit in inside["objects"].as_array().expect("objects") {
+        assert!(hit.get("wholly_inside").is_none(), "{hit}");
+        assert_eq!(hit.get("partly_outside").is_some(), hit["id"] == cable, "{hit}");
+    }
+    assert_eq!(inside["objects"].as_array().expect("objects").len(), 4);
+    // Replies are not indented.
+    let raw = call(&ro, "in_space", json!({"space_id": cambusa}))
+        .await
+        .expect("in_space");
+    let text = &raw.content[0].as_text().expect("text").text;
+    assert!(!text.contains('\n'), "{text}");
     let inside = ok(&ro, "in_space", json!({"space_id": cambusa, "detail": true})).await;
     assert!(inside["objects"][0].get("geometry").is_some());
+    for hit in inside["objects"].as_array().expect("objects") {
+        assert_eq!(hit["wholly_inside"], hit["id"] != cable, "{hit}");
+    }
     let nearest = ok(
         &ro,
         "nearest",

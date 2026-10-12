@@ -349,7 +349,7 @@ impl House {
     }
 
     #[tool(
-        description = "The live objects and smaller spaces inside a space, on the same floor (or outdoors for an outdoor space). Each object says whether it lies `wholly_inside` and carries `placement`, `exact` or `approximate` (near where it is, such as the middle of its room). Objects whose position is not known (`unplaced`) are left out, and `unplaced_omitted` counts those whose stand in position fell inside. Objects are short by default: `id`, `kind`, `name`, `site_id`, `floor_id`, `placement` and `in_space`, the smallest live space covering the object's position, which may be a smaller space inside this one. `detail: true` adds attributes, outside identifiers and geometry as GeoJSON."
+        description = "The live objects and smaller spaces inside a space, on the same floor (or outdoors for an outdoor space). Each object carries `placement`, `exact` or `approximate` (near where it is, such as the middle of its room). Objects whose position is not known (`unplaced`) are left out, and `unplaced_omitted` counts those whose stand in position fell inside. Objects are short by default: `id`, `kind`, `name`, `site_id`, `floor_id`, `placement` and `in_space`, the smallest live space covering the object's position, which may be a smaller space inside this one, and `partly_outside: true` on a line or area that crosses the space's edge. `detail: true` adds attributes, outside identifiers and geometry as GeoJSON, and `wholly_inside` on every object."
     )]
     async fn in_space(&self, Parameters(p): Parameters<InSpaceParams>) -> Result<CallToolResult, ErrorData> {
         let space = sqlx::query("SELECT id FROM live_space WHERE id = $1")
@@ -388,7 +388,14 @@ impl House {
         let mut object_values = Vec::with_capacity(objects.len());
         for row in objects {
             let mut value = object_hit(row, p.detail)?;
-            value["wholly_inside"] = json!(row.get::<bool, _>("wholly_inside"));
+            let wholly_inside = row.get::<bool, _>("wholly_inside");
+            // A point that meets the space is always inside it, so a short
+            // reply names only the exceptions.
+            if p.detail {
+                value["wholly_inside"] = json!(wholly_inside);
+            } else if !wholly_inside {
+                value["partly_outside"] = json!(true);
+            }
             object_values.push(value);
         }
         json_result(json!({

@@ -90,7 +90,7 @@ impl House {
             }
         };
         let field = if last.is_some() { "from_space" } else { "space_id" };
-        let site_id: i64 = sqlx::query_scalar("SELECT site_id FROM space WHERE id = $1 AND deleted_at IS NULL")
+        let site_id: i64 = sqlx::query_scalar("SELECT site_id FROM live_space WHERE id = $1")
             .bind(first)
             .fetch_optional(&self.db)
             .await
@@ -147,7 +147,7 @@ impl House {
 
 impl House {
     async fn site_spaces(&self, site_id: i64) -> Result<HashMap<i64, Space>, ErrorData> {
-        let rows = sqlx::query("SELECT id, name, kind, floor_id FROM space WHERE site_id = $1 AND deleted_at IS NULL")
+        let rows = sqlx::query("SELECT id, name, kind, floor_id FROM live_space WHERE site_id = $1")
             .bind(site_id)
             .fetch_all(&self.db)
             .await
@@ -173,7 +173,7 @@ impl House {
             "SELECT id, name, floor_id, attributes, GeometryType(geom) = 'LINESTRING' AND ST_NPoints(geom) = 2 AS line,
                     ST_X(ST_StartPoint(geom)) AS x0, ST_Y(ST_StartPoint(geom)) AS y0,
                     ST_X(ST_EndPoint(geom)) AS x1, ST_Y(ST_EndPoint(geom)) AS y1
-             FROM object WHERE site_id = $1 AND kind = 'opening' AND deleted_at IS NULL ORDER BY id",
+             FROM live_object WHERE site_id = $1 AND kind = 'opening' ORDER BY id",
         )
         .bind(site_id)
         .fetch_all(&self.db)
@@ -249,7 +249,7 @@ impl House {
         let rows = sqlx::query(
             "SELECT u.door, u.side, s.id, ST_Area(s.geom) AS area
              FROM unnest($1::bigint[], $2::int[], $3::bigint[], $4::text[]) AS u(door, side, floor_id, wkt)
-             JOIN space s ON s.site_id = $5 AND s.floor_id = u.floor_id AND s.deleted_at IS NULL
+             JOIN live_space s ON s.site_id = $5 AND s.floor_id = u.floor_id
                          AND s.kind <> ALL($6) AND ST_Intersects(s.geom, ST_GeomFromText(u.wkt, 0))
              WHERE ST_Area(ST_Intersection(s.geom, ST_GeomFromText(u.wkt, 0))) > 1e-9",
         )

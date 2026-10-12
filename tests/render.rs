@@ -32,6 +32,7 @@ fn plan(highlight_light: bool) -> Plan {
     Plan {
         title: "Test site, Ground".into(),
         label_size: LabelSize::Normal,
+        not_placed: 0,
         rotation: 30.0,
         extent: Extent {
             xmin: 0.0,
@@ -54,7 +55,10 @@ fn plan(highlight_light: bool) -> Plan {
             ),
             feature(
                 json!({"type": "Point", "coordinates": [2.0, 2.5]}),
-                Style::Object { kind: "light".into() },
+                Style::Object {
+                    kind: "light".into(),
+                    approximate: false,
+                },
                 Some(("LIGHT", 2.0, 2.5)),
                 highlight_light,
             ),
@@ -159,6 +163,7 @@ fn room_plan(dx: f64, dy: f64, rotation: f64) -> Plan {
     Plan {
         title: "Shape".into(),
         label_size: LabelSize::Normal,
+        not_placed: 0,
         rotation,
         extent: Extent {
             xmin: 0.0,
@@ -211,8 +216,15 @@ fn a_long_label_at_the_plan_edge_stays_out_from_under_the_north_arrow() {
         let mut plan = room_plan(9.0, 3.0, rotation);
         let light = json!({"type": "Point", "coordinates": [9.0, y]});
         let label = label.then_some(("A ceiling light with a long name", 9.0, y));
-        plan.features
-            .push(feature(light, Style::Object { kind: "light".into() }, label, false));
+        plan.features.push(feature(
+            light,
+            Style::Object {
+                kind: "light".into(),
+                approximate: false,
+            },
+            label,
+            false,
+        ));
         plan
     };
     for size in [200, 1600] {
@@ -318,6 +330,7 @@ fn tall_plan_fits_the_long_side_with_room_for_the_footer() {
     let plan = Plan {
         title: "Tall".into(),
         label_size: LabelSize::Normal,
+        not_placed: 0,
         rotation: 0.0,
         extent: Extent {
             xmin: 0.0,
@@ -378,7 +391,10 @@ fn lights(at: &[(&str, f64, f64)]) -> Plan {
     for &(label, x, y) in at {
         plan.features.push(feature(
             json!({"type": "Point", "coordinates": [x, y]}),
-            Style::Object { kind: "light".into() },
+            Style::Object {
+                kind: "light".into(),
+                approximate: false,
+            },
             Some((label, x, y)),
             false,
         ));

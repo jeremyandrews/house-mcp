@@ -316,7 +316,7 @@ async fn insert_feature(
 async fn import_site(tx: &mut PgConnection, floor_id: Option<i64>, site_id: Option<i64>) -> Result<i64, ErrorData> {
     match (floor_id, site_id) {
         (Some(floor_id), site_id) => {
-            let floor_site: i64 = sqlx::query_scalar("SELECT site_id FROM floor WHERE id = $1 AND deleted_at IS NULL")
+            let floor_site: i64 = sqlx::query_scalar("SELECT site_id FROM live_floor WHERE id = $1")
                 .bind(floor_id)
                 .fetch_optional(&mut *tx)
                 .await

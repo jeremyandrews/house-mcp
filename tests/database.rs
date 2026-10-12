@@ -332,3 +332,77 @@ async fn linework_and_imports_belong_to_a_floor_or_a_site() {
     let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
     assert_eq!(code.as_deref(), Some("23514"), "{error}");
 }
+
+#[tokio::test]
+async fn the_placement_migration_fills_from_the_position_attribute() {
+    let db = TestDb::new().await;
+    let pool = house_mcp::db::connect(&db.house_url()).await.expect("connect as house");
+    // The schema as it was before placement, seeded the way objects were.
+    house_mcp::db::MIGRATOR.run_to(3, &pool).await.expect("migrations to 3");
+    let mut tx = house_mcp::db::begin_write(&pool, "jesse", "seeding the test")
+        .await
+        .expect("begin");
+    let site: i64 = sqlx::query_scalar("INSERT INTO site (name) VALUES ('test') RETURNING id")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("site");
+    let mut ids = Vec::new();
+    for (name, attributes) in [
+        ("stacked", r#"{"position": "site_unplaced", "note": "kept"}"#),
+        ("in its room", r#"{"position": "room_centre"}"#),
+        ("by eye", r#"{"position": "paced out"}"#),
+        ("surveyed", r#"{}"#),
+    ] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO object (site_id, kind, name, geom, attributes) VALUES ($1, 'camera', $2, ST_MakePoint(7, -3), $3::jsonb) RETURNING id",
+        )
+        .bind(site)
+        .bind(name)
+        .bind(attributes)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("object");
+        ids.push(id);
+    }
+    tx.commit().await.expect("commit");
+
+    house_mcp::db::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("the rest of the migrations");
+    let rows: Vec<(i64, String, Value)> = sqlx::query_as("SELECT id, placement, attributes FROM object ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("objects");
+    let placements: Vec<(i64, &str)> = rows.iter().map(|(id, p, _)| (*id, p.as_str())).collect();
+    assert_eq!(
+        placements,
+        [
+            (ids[0], "unplaced"),
+            (ids[1], "approximate"),
+            (ids[2], "approximate"),
+            (ids[3], "exact")
+        ]
+    );
+    // The attribute stays as it was.
+    assert_eq!(
+        rows[0].2,
+        serde_json::json!({"position": "site_unplaced", "note": "kept"})
+    );
+    // The fill is recorded like any other write.
+    let fill = changes(&pool, "object", ids[0]).await;
+    let last = fill.last().expect("a change");
+    assert_eq!(
+        (last.author.as_str(), last.reason.as_str(), last.operation.as_str()),
+        ("migration 0004", "placement from the position attribute", "UPDATE")
+    );
+    let surveyed = changes(&pool, "object", ids[3]).await;
+    assert_eq!(surveyed.len(), 1, "an object with no position is not written");
+    // And the placement is refused anything but the three values.
+    let refused = sqlx::query("UPDATE object SET placement = 'guessed' WHERE id = $1")
+        .bind(ids[3])
+        .execute(&pool)
+        .await
+        .expect_err("refused");
+    assert!(refused.to_string().contains("object_placement"), "{refused}");
+}

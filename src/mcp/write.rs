@@ -162,7 +162,33 @@ pub struct UpsertObjectParams {
     pub refs: Option<BTreeMap<String, String>>,
     /// Replaces the attributes when given; see set_attributes to change some.
     pub attributes: Option<serde_json::Map<String, Value>>,
+    /// How the geometry was found: `exact`, `approximate` or `unplaced`.
+    /// Default `exact` on create. On update, left out keeps the stored
+    /// value, even when the geometry changes.
+    pub placement: Option<Placement>,
     pub reason: String,
+}
+
+/// How an object's geometry was found.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    /// Where it is.
+    Exact,
+    /// Near where it is, such as the middle of its room.
+    Approximate,
+    /// Not known; the geometry is a stand in.
+    Unplaced,
+}
+
+impl Placement {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Approximate => "approximate",
+            Self::Unplaced => "unplaced",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -402,7 +428,7 @@ impl House {
     }
 
     #[tool(
-        description = "Create an object (a light, switch, socket, access point, camera, sensor, speaker, tree, pipe, cable run, opening or anything else), or update one when `id` is given. On create, `kind`, `name` and `geometry` are required. On update every field but `id`, `site_id` and `reason` is optional, and a field left out keeps its stored value, so a rename is {\"id\": 41, \"site_id\": 1, \"name\": \"Reading lamp\", \"reason\": \"...\"}; send `floor_id` or `height` as null to clear it. `refs` and `attributes`, when given, replace them all; link_ref and set_attributes change some.\n\nAn `opening` is a door, arch or open doorway that render_plan draws as a gap in the wall with a jamb tick at each end: its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. Attributes: `opening_type` is `door`, `arch` (two dashed lines across the gap, one along each face of the wall) or `opening` (the gap alone), default `opening`; `wall_depth` is the wall's thickness in metres, a positive number, default 0.6, and the gap cut is that wide across the wall. A door also takes `hinge`, the `start` or `end` of the line the leaf hangs from (default `start`), `swing`, the `left` or `right` of the line's direction it opens towards (default `left`), and `leaves`, 1 or 2 (default 1; 2 hangs a half leaf on each jamb); it is drawn as its leaf square to the wall and the quarter circle of its swing. `connects`, a list of exactly two space ids, says which spaces the opening joins; without it the connections tool finds them from the geometry. Any other geometry is drawn as an ordinary object. Door example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Door to the hall\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[4.0, 1.2], [4.0, 2.1]]}, \"attributes\": {\"opening_type\": \"door\", \"hinge\": \"end\", \"swing\": \"right\", \"wall_depth\": 0.3, \"connects\": [12, 13]}, \"reason\": \"door on the survey\"}. Arch example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Arch to the kitchen\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[7.0, 0.5], [7.0, 2.1]]}, \"attributes\": {\"opening_type\": \"arch\", \"wall_depth\": 0.45}, \"reason\": \"arch on the survey\"}."
+        description = "Create an object (a light, switch, socket, access point, camera, sensor, speaker, tree, pipe, cable run, opening or anything else), or update one when `id` is given. On create, `kind`, `name` and `geometry` are required. On update every field but `id`, `site_id` and `reason` is optional, and a field left out keeps its stored value, so a rename is {\"id\": 41, \"site_id\": 1, \"name\": \"Reading lamp\", \"reason\": \"...\"}; send `floor_id` or `height` as null to clear it. `refs` and `attributes`, when given, replace them all; link_ref and set_attributes change some. `placement` says how the geometry was found: `exact` (the default on create), `approximate` (near where it is, such as the middle of its room) or `unplaced` (not known; the geometry is only a stand in, and nearest, what_is_at, in_space and render_plan leave the object out). On update, a `placement` left out keeps the stored one even when new `geometry` is given, so moving an unplaced or approximate object to where it really is takes `placement: \"exact\"` as well.\n\nAn `opening` is a door, arch or open doorway that render_plan draws as a gap in the wall with a jamb tick at each end: its geometry is a LineString of exactly two points along the wall's centre line, from one jamb to the other, on the opening's floor. Attributes: `opening_type` is `door`, `arch` (two dashed lines across the gap, one along each face of the wall) or `opening` (the gap alone), default `opening`; `wall_depth` is the wall's thickness in metres, a positive number, default 0.6, and the gap cut is that wide across the wall. A door also takes `hinge`, the `start` or `end` of the line the leaf hangs from (default `start`), `swing`, the `left` or `right` of the line's direction it opens towards (default `left`), and `leaves`, 1 or 2 (default 1; 2 hangs a half leaf on each jamb); it is drawn as its leaf square to the wall and the quarter circle of its swing. `connects`, a list of exactly two space ids, says which spaces the opening joins; without it the connections tool finds them from the geometry. Any other geometry is drawn as an ordinary object. Door example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Door to the hall\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[4.0, 1.2], [4.0, 2.1]]}, \"attributes\": {\"opening_type\": \"door\", \"hinge\": \"end\", \"swing\": \"right\", \"wall_depth\": 0.3, \"connects\": [12, 13]}, \"reason\": \"door on the survey\"}. Arch example: {\"site_id\": 1, \"floor_id\": 2, \"kind\": \"opening\", \"name\": \"Arch to the kitchen\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[7.0, 0.5], [7.0, 2.1]]}, \"attributes\": {\"opening_type\": \"arch\", \"wall_depth\": 0.45}, \"reason\": \"arch on the survey\"}."
     )]
     async fn upsert_object(
         &self,
@@ -435,15 +461,16 @@ impl House {
         let refs = p.refs.map(|refs| json!(refs));
         let id: Option<i64> = sqlx::query_scalar(
             "WITH created AS (
-                 INSERT INTO object (site_id, floor_id, kind, name, geom, height, refs, attributes)
-                 SELECT $2, $3, $4, $5, ST_GeomFromWKB($6, 0), $7, coalesce($8, '{}'), coalesce($9, '{}')
+                 INSERT INTO object (site_id, floor_id, kind, name, geom, height, refs, attributes, placement)
+                 SELECT $2, $3, $4, $5, ST_GeomFromWKB($6, 0), $7, coalesce($8, '{}'), coalesce($9, '{}'), coalesce($12, 'exact')
                  WHERE $1::bigint IS NULL RETURNING id
              ), updated AS (
                  UPDATE object SET site_id = $2, floor_id = CASE WHEN $10 THEN $3 ELSE floor_id END,
                                    kind = coalesce($4, kind), name = coalesce($5, name),
                                    geom = coalesce(ST_GeomFromWKB($6, 0), geom),
                                    height = CASE WHEN $11 THEN $7 ELSE height END,
-                                   refs = coalesce($8, refs), attributes = coalesce($9, attributes)
+                                   refs = coalesce($8, refs), attributes = coalesce($9, attributes),
+                                   placement = coalesce($12, placement)
                  WHERE id = $1 AND deleted_at IS NULL RETURNING id
              )
              SELECT id FROM created UNION ALL SELECT id FROM updated",
@@ -459,6 +486,7 @@ impl House {
         .bind(p.attributes.map(Value::Object))
         .bind(p.floor_id.is_some())
         .bind(p.height.is_some())
+        .bind(p.placement.map(Placement::as_str))
         .fetch_optional(&mut *tx)
         .await
         .map_err(error::db)?;
@@ -619,7 +647,7 @@ impl House {
     }
 
     #[tool(
-        description = "Mark a site, floor, space, object, file or note as deleted. Nothing is removed; restore brings it back."
+        description = "Mark a site, floor, space, object, file or note as deleted. Nothing is removed; restore brings it back. Deleting a site or floor marks only that row, but every read tool then hides what it holds as well: a site's floors, spaces and objects, a floor's spaces and objects. The reply's `hides` counts the floors, spaces and objects that were visible and no longer are, the deleted floor itself included. Restoring the site or floor brings them all back as they were."
     )]
     async fn delete(
         &self,
@@ -629,6 +657,7 @@ impl House {
         let author = &writer(&parts)?.name;
         let reason = reason(&p.reason)?;
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
+        let visible_before = visible_within(&mut tx, p.kind, p.id).await?;
         let deleted: Option<i64> = sqlx::query_scalar(per_table!(
             p.kind,
             "UPDATE ",
@@ -639,12 +668,20 @@ impl House {
         .await
         .map_err(error::db)?;
         deleted.ok_or_else(|| error::invalid("id", "no live row of this kind with this id"))?;
+        let mut result = json!({ "deleted": { "kind": p.kind, "id": p.id } });
+        if let (Some(before), Some(after)) = (visible_before, visible_within(&mut tx, p.kind, p.id).await?) {
+            result["hides"] = json!({
+                "floors": before[0] - after[0],
+                "spaces": before[1] - after[1],
+                "objects": before[2] - after[2],
+            });
+        }
         tx.commit().await.map_err(error::db)?;
-        json_result(json!({ "deleted": { "kind": p.kind, "id": p.id } }))
+        json_result(result)
     }
 
     #[tool(
-        description = "Bring back a deleted site, floor, space, object, file or note, including one removed outright by another client, from its recorded history."
+        description = "Bring back a deleted site, floor, space, object, file or note, including one removed outright by another client, from its recorded history. Restoring a site or floor brings back the floors, spaces and objects it held as they were, since deleting it marked only that row; one deleted on its own before stays deleted."
     )]
     async fn restore(
         &self,
@@ -674,6 +711,30 @@ impl House {
     }
 }
 
+/// For a site or floor, how many live floors, spaces and objects it holds,
+/// the floor itself counted among the floors; `None` for any other kind.
+async fn visible_within(tx: &mut PgConnection, kind: Kind, id: i64) -> Result<Option<[i64; 3]>, ErrorData> {
+    let sql = match kind {
+        Kind::Site => {
+            "SELECT (SELECT count(*) FROM live_floor WHERE site_id = $1),
+                    (SELECT count(*) FROM live_space WHERE site_id = $1),
+                    (SELECT count(*) FROM live_object WHERE site_id = $1)"
+        }
+        Kind::Floor => {
+            "SELECT (SELECT count(*) FROM live_floor WHERE id = $1),
+                    (SELECT count(*) FROM live_space WHERE floor_id = $1),
+                    (SELECT count(*) FROM live_object WHERE floor_id = $1)"
+        }
+        _ => return Ok(None),
+    };
+    let (floors, spaces, objects): (i64, i64, i64) = sqlx::query_as(sql)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(error::db)?;
+    Ok(Some([floors, spaces, objects]))
+}
+
 /// Puts back a row that a client removed outright, as it was just before the
 /// removal but live: a row soft deleted before it was removed would otherwise
 /// come back still deleted.
@@ -700,13 +761,25 @@ async fn restore_removed_row(tx: &mut PgConnection, kind: Kind, id: i64) -> Resu
         kind,
         "INSERT INTO ",
         " OVERRIDING SYSTEM VALUE SELECT * FROM jsonb_populate_record(NULL::",
-        ", $1 || '{\"deleted_at\": null}'::jsonb)"
+        ", $2 || $1 || '{\"deleted_at\": null}'::jsonb)"
     ))
     .bind(before)
+    .bind(added_column_defaults(kind))
     .execute(&mut *tx)
     .await
     .map_err(error::db)?;
     Ok(())
+}
+
+/// The defaults of NOT NULL columns added to a table after rows were first
+/// recorded, which a row recorded before then lacks. jsonb_populate_record
+/// fills a missing key with null rather than the column's default.
+fn added_column_defaults(kind: Kind) -> Value {
+    match kind {
+        Kind::Site | Kind::Floor => json!({ "attributes": {} }),
+        Kind::Object => json!({ "placement": "exact" }),
+        Kind::Space | Kind::File | Kind::Note => json!({}),
+    }
 }
 
 pub struct NewFile<'a> {

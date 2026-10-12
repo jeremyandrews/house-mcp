@@ -101,7 +101,7 @@ pub enum Highlight {
 #[tool_router(router = plan_router, vis = "pub(super)")]
 impl House {
     #[tool(
-        description = "Draw a floor, or the site's outdoor areas with no `floor_id`, as a plan with a scale bar and north arrow. Returns a PNG to look at and a short JSON summary (size in pixels, and the legend); the SVG the PNG was drawn from comes too only with `include_svg: true`. Each space and object is labelled from the first attribute named in `label_from` that holds a non-empty string, by default `common_name` (the family's nickname) and then `name_en`, with a leading \"the \" dropped and the first letter capitalized; without one it uses the row's `name` as stored. Pass `label_from: []` to label everything by `name`. Labels never overlap and are never cut short: highlighted features are placed first, then spaces from the largest, then objects; each label tries its anchor, then eight spots around it, then smaller type, and a label with no room at all becomes a small numbered marker by its feature with its text in a legend beside the scale bar. A space's label always covers part of its space. `label_size` is `small`, `normal` or `large`. Objects of kind `opening` cut a gap through the floor's walls at render time, with jamb ticks either side, and are drawn by `opening_type`: an `arch` as two dashed lines across the gap along the wall's faces, a `door` as its leaf square to the wall with the quarter circle of its swing, an `opening` as the gap alone. The stored linework never changes. Without `floor_id`, linework imported onto the site with no floor is drawn."
+        description = "Draw a floor, or the site's outdoor areas with no `floor_id`, as a plan with a scale bar and north arrow. Returns a PNG to look at and a short JSON summary (size in pixels, and the legend); the SVG the PNG was drawn from comes too only with `include_svg: true`. Each space and object is labelled from the first attribute named in `label_from` that holds a non-empty string, by default `common_name` (the family's nickname) and then `name_en`, with a leading \"the \" dropped and the first letter capitalized; without one it uses the row's `name` as stored. Pass `label_from: []` to label everything by `name`. Labels never overlap and are never cut short: highlighted features are placed first, then spaces from the largest, then objects; each label tries its anchor, then eight spots around it, then smaller type, and a label with no room at all becomes a small numbered marker by its feature with its text in a legend beside the scale bar. A space's label always covers part of its space. `label_size` is `small`, `normal` or `large`. Objects of kind `opening` cut a gap through the floor's walls at render time, with jamb ticks either side, and are drawn by `opening_type`: an `arch` as two dashed lines across the gap along the wall's faces, a `door` as its leaf square to the wall with the quarter circle of its swing, an `opening` as the gap alone. The stored linework never changes. Without `floor_id`, linework imported onto the site with no floor is drawn. An object whose position is not known (`placement: unplaced`) is not drawn: the legend says how many, as \"N items not placed\", and the summary gives the count as `not_placed`. An object placed only near where it is (`placement: approximate`, such as at the middle of its room) is drawn hollow, with a dashed outline, and the legend keys that style as \"position approximate\". The summary lists those legend lines in `notes`."
     )]
     async fn render_plan(&self, Parameters(p): Parameters<RenderPlanParams>) -> Result<CallToolResult, ErrorData> {
         let size = p.size.unwrap_or(1600);
@@ -112,7 +112,7 @@ impl House {
             ));
         }
         let site = sqlx::query(
-            "SELECT s.name, s.rotation, f.name AS floor FROM site s LEFT JOIN floor f ON f.id = $2 AND f.site_id = s.id AND f.deleted_at IS NULL
+            "SELECT s.name, s.rotation, f.name AS floor FROM site s LEFT JOIN live_floor f ON f.id = $2 AND f.site_id = s.id
              WHERE s.id = $1 AND s.deleted_at IS NULL",
         )
         .bind(p.site_id)
@@ -135,6 +135,7 @@ impl House {
             None => Vec::new(),
         };
         let mut features = Vec::new();
+        let mut not_placed = 0;
         if p.layers.linework {
             features.extend(self.linework_features(p.site_id, p.floor_id, &openings).await?);
         }
@@ -143,7 +144,9 @@ impl House {
         }
         if p.layers.objects.as_ref().is_none_or(|kinds| !kinds.is_empty()) {
             let cutting: HashSet<i64> = openings.iter().map(|o| o.id).collect();
-            features.extend(self.object_features(&p, &highlight, &label_from, &cutting).await?);
+            let (objects, unplaced) = self.object_features(&p, &highlight, &label_from, &cutting).await?;
+            features.extend(objects);
+            not_placed = unplaced;
             if p.layers
                 .objects
                 .as_ref()
@@ -179,6 +182,7 @@ impl House {
             extent,
             features,
             label_size: p.label_size,
+            not_placed,
         };
         let rendered = tokio::task::spawn_blocking(move || render::render(&plan, size))
             .await
@@ -190,6 +194,8 @@ impl House {
             "legend": rendered.legend.iter().enumerate()
                 .map(|(i, text)| json!({ "marker": i + 1, "label": text }))
                 .collect::<Vec<_>>(),
+            "not_placed": not_placed,
+            "notes": rendered.notes,
         });
         let mut content = vec![
             ContentBlock::image(STANDARD.encode(&rendered.png), "image/png"),
@@ -211,7 +217,7 @@ impl House {
             "SELECT id, attributes, ST_AsBinary(geom) AS wkb, GeometryType(geom) AS shape, ST_NPoints(geom) AS points,
                     ST_X(ST_StartPoint(geom)) AS x0, ST_Y(ST_StartPoint(geom)) AS y0,
                     ST_X(ST_EndPoint(geom)) AS x1, ST_Y(ST_EndPoint(geom)) AS y1
-             FROM object WHERE site_id = $1 AND floor_id = $2 AND kind = 'opening' AND deleted_at IS NULL",
+             FROM live_object WHERE site_id = $1 AND floor_id = $2 AND kind = 'opening' AND placement <> 'unplaced'",
         )
         .bind(site_id)
         .bind(floor_id)
@@ -267,7 +273,7 @@ impl House {
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
             "WITH cut AS (
                  SELECT ST_Union(ST_Buffer(o.geom, c.depth / 2, 'endcap=flat')) AS area
-                 FROM unnest($2::bigint[], $3::float8[]) AS c(id, depth) JOIN object o ON o.id = c.id
+                 FROM unnest($2::bigint[], $3::float8[]) AS c(id, depth) JOIN live_object o ON o.id = c.id
              ), drawn AS (
                  SELECT CASE WHEN ST_Intersects(l.geom, cut.area) THEN ST_Difference(l.geom, cut.area) ELSE l.geom END AS geom
                  FROM linework l CROSS JOIN cut
@@ -302,7 +308,7 @@ impl House {
     ) -> Result<Vec<Feature>, ErrorData> {
         let rows = sqlx::query(
             "SELECT id, name, kind, attributes, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
-             FROM space WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2",
+             FROM live_space WHERE site_id = $1 AND floor_id IS NOT DISTINCT FROM $2",
         )
         .bind(p.site_id)
         .bind(p.floor_id)
@@ -326,10 +332,10 @@ impl House {
         highlight: &HashSet<Highlight>,
         label_from: &[String],
         cutting: &HashSet<i64>,
-    ) -> Result<Vec<Feature>, ErrorData> {
+    ) -> Result<(Vec<Feature>, usize), ErrorData> {
         let rows = sqlx::query(
-            "SELECT id, name, kind, attributes, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
-             FROM object WHERE site_id = $1 AND deleted_at IS NULL AND floor_id IS NOT DISTINCT FROM $2
+            "SELECT id, name, kind, placement, attributes, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
+             FROM live_object WHERE site_id = $1 AND floor_id IS NOT DISTINCT FROM $2
                AND ($3::text[] IS NULL OR kind = ANY($3))",
         )
         .bind(p.site_id)
@@ -338,16 +344,25 @@ impl House {
         .fetch_all(&self.db)
         .await
         .map_err(error::db)?;
-        Ok(rows
+        // An unplaced object's geometry is a stand in, so it is counted for
+        // the legend rather than drawn.
+        let (unplaced, placed): (Vec<_>, Vec<_>) = rows
             .iter()
             .filter(|r| !cutting.contains(&r.get::<i64, _>("id")))
+            .partition(|r| r.get::<&str, _>("placement") == "unplaced");
+        let features = placed
+            .into_iter()
             .map(|r| Feature {
                 wkb: r.get("wkb"),
                 label: label(r, p.layers.labels && r.get::<&str, _>("kind") != "opening", label_from),
-                style: Style::Object { kind: r.get("kind") },
+                style: Style::Object {
+                    kind: r.get("kind"),
+                    approximate: r.get::<&str, _>("placement") == "approximate",
+                },
                 highlight: highlight.contains(&Highlight::Object(r.get("id"))),
             })
-            .collect())
+            .collect();
+        Ok((features, unplaced.len()))
     }
 
     async fn extent(&self, features: &[Feature]) -> Result<Extent, ErrorData> {

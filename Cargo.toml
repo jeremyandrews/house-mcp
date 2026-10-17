@@ -11,11 +11,13 @@ publish = false
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["serde"] }
+crc32fast = "1.5.2"
 dxf = "0.6.2"
 geozero = { version = "0.15.1", default-features = false, features = ["with-wkb", "with-geojson"] }
 hayro = "0.8.0"
 hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+miniz_oxide = "0.9.1"
 resvg = { version = "0.48.1", default-features = false, features = ["text"] }
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
 schemars = "1.2.2"

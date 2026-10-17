@@ -1337,7 +1337,70 @@ fn rasterize(svg: &str) -> Result<Vec<u8>, String> {
     let size = tree.size().to_int_size();
     let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height()).ok_or("plan has no area")?;
     resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
-    pixmap.encode_png().map_err(|e| format!("PNG encoding failed: {e}"))
+    encode_png(&pixmap)
+}
+
+/// Encodes a pixmap as PNG, with the same bytes whatever else is linked in.
+///
+/// tiny-skia's encoder deflates through flate2, and flate2 switches backend
+/// from miniz_oxide to zlib-rs as soon as any crate in the build enables its
+/// `zlib-rs` feature (hayro does). The pixels stay the same but the bytes do
+/// not, so a plan that has not changed would stop rendering byte-identical.
+/// The image data is therefore inflated again and deflated with miniz_oxide
+/// at flate2's default level, which is what the encoder always produced.
+fn encode_png(pixmap: &tiny_skia::Pixmap) -> Result<Vec<u8>, String> {
+    let png = pixmap.encode_png().map_err(|e| format!("PNG encoding failed: {e}"))?;
+    let chunks = png_chunks(&png).ok_or("PNG encoding produced malformed chunks")?;
+    let idat: Vec<u8> = chunks
+        .iter()
+        .filter(|(kind, _)| kind == b"IDAT")
+        .flat_map(|(_, data)| data.iter().copied())
+        .collect();
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat)
+        .map_err(|e| format!("PNG encoding produced unreadable image data: {e:?}"))?;
+    let deflated = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+
+    let mut out = PNG_SIGNATURE.to_vec();
+    let mut idat_written = false;
+    for (kind, data) in chunks {
+        if &kind != b"IDAT" {
+            put_png_chunk(&mut out, &kind, data);
+        } else if !idat_written {
+            idat_written = true;
+            for part in deflated.chunks(PNG_MAX_CHUNK) {
+                put_png_chunk(&mut out, b"IDAT", part);
+            }
+        }
+    }
+    Ok(out)
+}
+
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// The largest chunk the png crate writes, so image data splits as it did.
+const PNG_MAX_CHUNK: usize = (u32::MAX >> 1) as usize;
+
+/// A PNG's chunks as (type, data), or `None` if they do not parse.
+fn png_chunks(png: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
+    let mut rest = png.strip_prefix(PNG_SIGNATURE)?;
+    let mut chunks = Vec::new();
+    while !rest.is_empty() {
+        let len = usize::try_from(u32::from_be_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+        let kind: [u8; 4] = rest.get(4..8)?.try_into().ok()?;
+        chunks.push((kind, rest.get(8..8 + len)?));
+        rest = rest.get(12 + len..)?;
+    }
+    Some(chunks)
+}
+
+fn put_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    let len = u32::try_from(data.len()).expect("chunks are split below 2^31 bytes");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(kind);
+    crc.update(data);
+    out.extend_from_slice(&crc.finalize().to_be_bytes());
 }
 
 /// Collects one geometry as SVG path data in pixels, its points as circle
@@ -1564,5 +1627,33 @@ mod tests {
         }
         let word = wrap("Supercalifragilistic", 40.0, 12.0, &font);
         assert_eq!(word.concat(), "Supercalifragilistic");
+    }
+
+    /// The bytes tiny-skia's encoder produced for this pixmap before hayro
+    /// linked zlib-rs in (house-mcp 9d3412d). A plan that does not change
+    /// must keep rendering byte-identical across releases.
+    #[test]
+    fn png_bytes_do_not_depend_on_the_deflate_backend() {
+        use sha2::{Digest, Sha256};
+
+        let mut pixmap = tiny_skia::Pixmap::new(97, 61).unwrap();
+        for (i, p) in pixmap.pixels_mut().iter_mut().enumerate() {
+            let (x, y) = ((i % 97) as u32, (i / 97) as u32);
+            let a = if (x / 8 + y / 8) % 3 == 0 { 128 } else { 255 };
+            let c = |v: u32| ((v % 256) * a / 255) as u8;
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(c(x * 3), c(y * 5), c(x * y), a as u8).unwrap();
+        }
+        let png = encode_png(&pixmap).unwrap();
+        assert_eq!(png.len(), 3735);
+        assert_eq!(
+            hex::encode(Sha256::digest(&png)),
+            "6598410d08a9a5f074b513391880c719aa63de1b6be80a40e8c0de89a4411921"
+        );
+
+        let unchanged = image::load_from_memory(&png).unwrap().to_rgba8();
+        let direct = image::load_from_memory(&pixmap.encode_png().unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(unchanged.as_raw(), direct.as_raw());
     }
 }

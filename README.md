@@ -10,19 +10,24 @@ Each site has its own frame: metres, x east, y north, z up, with an origin chose
 
 | Table | Holds |
 | --- | --- |
-| `site` | name, optional origin and rotation, attributes |
+| `area` | an area around sites (neighbourhood, town, region, any lowercase `kind`), optional parent area, optional outline in WGS 84, attributes |
+| `site` | name, optional origin and rotation, optional area, attributes |
 | `floor` | site, name, level, elevation, ceiling height, attributes |
 | `space` | site, floor (null outdoors), name, kind (`room`, `terrace`, `garden_bed`, `pool`, `parcel`, `building`), polygon, wall material, attributes |
 | `object` | site, floor (null outdoors), kind (`light`, `switch`, `socket`, `access_point`, `camera`, `sensor`, `speaker`, `tree`, `pipe`, `cable_run`, `opening` or any other lowercase word), name, point, line or polygon, `placement` (`exact`, `approximate` or `unplaced`), height above the floor, outside identifiers in `refs`, attributes |
+| `detail` | a drawing of an object, or of part of another detail, in its own millimetre frame: site, exactly one parent (`object_id` or `parent_detail_id`), name, `view` (`top`, `front`, `side`, `section`, `exploded`, `other`), optional `measurements` with their sources, optional `placement` in the parent, attributes |
+| `detail_part` | a labelled part of a detail, any 2D geometry in the detail's frame, attributes such as a material or finish |
 | `linework` | CAD geometry as drawn, by import and layer, for rendering; on a floor, or on the site with no floor |
-| `dxf_import` | one row per import of a drawing onto a floor, or onto a site with no floor |
+| `detail_linework` | the same for a detail, in its own table so that no floor or site query can reach it |
+| `dxf_import` | one row per import of a drawing onto a floor, onto a site with no floor, or onto a detail |
 | `file` | name, media type, size, sha256, optional links to a site, floor, space or object |
 | `note` | markdown text with a source line, linked like a file |
+| `file_link`, `note_link` | a file's or note's link to a detail or an area, beside the file and note tables |
 | `change` | every insert, update and delete on the tables above |
 
 The server never removes a row. A delete sets `deleted_at`, and `restore` clears it.
 
-Every read goes through three views, `live_floor`, `live_space` and `live_object`, which are the one definition of live: a row that is not deleted, on a site that is not deleted, and on a floor that is not deleted when it has one. Deleting a site or floor marks only that row, so every read tool stops returning what it holds at once, and restoring it brings all of it back as it was; `delete` reports how many floors, spaces and objects it hid. Writes use the tables. The views are granted to `house_qgis` and `house_ro` too, for QGIS layers that should show only what the server shows.
+Every read goes through the views `live_floor`, `live_space` and `live_object`, which are the one definition of live: a row that is not deleted, on a site that is not deleted, and on a floor that is not deleted when it has one. `live_detail`, `live_detail_part` and `live_area` extend it: a detail is live when it, every detail it is inside, and its object, floor and site are live; an area when it and every area it is inside are live. Deleting a site or floor marks only that row, so every read tool stops returning what it holds at once, and restoring it brings all of it back as it was; `delete` reports how many floors, spaces and objects it hid. Writes use the tables. The views are granted to `house_qgis` and `house_ro` too, for QGIS layers that should show only what the server shows.
 
 ### The change log
 
@@ -33,7 +38,7 @@ Triggers on every model table write a `change` row for each insert, update and d
 | Role | May |
 | --- | --- |
 | `house` | own everything; the server's role, and the only one that runs migrations |
-| `house_qgis` | select, insert, update and delete on `site`, `floor`, `space`, `object` and `note`; select on everything else; never write `change` |
+| `house_qgis` | select, insert, update and delete on `site`, `floor`, `space`, `object`, `note`, `area`, `detail` and `detail_part`; select on everything else; never write `change` |
 | `house_ro` | select on everything |
 
 The migrations grant to `house_qgis` and `house_ro` but do not create them, because the owning role cannot create roles. Both must exist before the server first starts, and the database needs the `postgis` extension, which only a superuser can create. The migrations create `unaccent` themselves: it is a trusted extension, which the owning role may create.
@@ -46,41 +51,46 @@ Read tools, available to both tokens:
 
 | Tool | Does |
 | --- | --- |
-| `list_sites` | live sites with their attributes, floors (with theirs) and georeference |
+| `list_sites` | live sites with their attributes, floors (with theirs), georeference and the area each is in |
 | `get_floor` | a floor with its attributes, spaces and objects as GeoJSON |
-| `find` | spaces and objects by any name they go by, kind, outside identifier or attribute, best match first; see [Finding things](#finding-things) |
+| `find` | spaces, objects and areas by any name they go by, kind, outside identifier or attribute, best match first; see [Finding things](#finding-things) |
 | `what_is_at` | the spaces containing a point, and the placed objects within a radius; with `floor_id`, outdoors and that floor, without it outdoors and every floor, each hit naming its floor |
 | `in_space` | the placed objects and smaller spaces inside a space |
 | `nearest` | the n placed objects of a kind nearest a point, space or object, in plan |
 | `measure` | area, perimeter and length, and the distance between two things |
 | `connections` | the openings that touch a space and the space beyond each, or the shortest way between two spaces through openings |
 | `list_files` | files, optionally by what they are linked to |
-| `get_file` | a file's metadata, with its content when it is UTF-8 text of at most 1 MiB |
+| `get_file` | a file's metadata, with its content as text, as an image, or as one PDF page drawn to PNG; see [Viewing files](#viewing-files) |
+| `get_detail` | a detail with its parts, measurements, placement, files, the details inside it and its path up to its object |
+| `context` | from any area, site, floor, space, object or detail: the chain up to the outermost area and the direct children; see [Levels](#levels) |
 | `search_notes` | notes containing some text |
 | `history` | the `change` rows for one thing |
-| `render_plan` | a floor or the site's outdoor areas as a PNG with a scale bar and north arrow, and a short JSON summary; the SVG too with `include_svg: true` |
+| `render_plan` | a floor or the site's outdoor areas as a PNG with a scale bar and north arrow, a detail in millimetres, or an area in UTM 32N, and a short JSON summary; the SVG too with `include_svg: true` |
 
 Write tools take a required `reason`. They are refused to the read only token and left out of its tool list.
 
 | Tool | Does |
 | --- | --- |
-| `create_site` | a site, optionally with an origin in any EPSG system and a rotation |
+| `create_site` | a site, optionally with an origin in any EPSG system, a rotation and an area |
 | `set_site_origin` | set or replace a site's origin, in any EPSG system, and optionally its rotation |
+| `set_site_area` | set or clear the area a site is in |
+| `upsert_area` | create an area, or update one by `id`, keeping every field left out |
+| `upsert_detail`, `upsert_detail_part` | create a detail or a part, or update one by `id`, keeping every field left out |
 | `upsert_floor` | create a floor, or replace an existing floor's fields |
 | `upsert_space`, `upsert_object` | create a row, or update one by `id`, keeping every field left out |
 | `set_attributes` | add, change or remove some attributes of a site, floor, space or object |
 | `link_ref` | set or remove one outside identifier on an object, such as `ha_entity_id` |
-| `add_note` | a markdown note with its source |
-| `upload_file` | text inline, or binary as base64 up to 25 MiB |
-| `import_geojson` | features in any EPSG system as spaces or objects, converted into the site frame |
-| `import_dxf` | a stored DXF drawing onto a floor, or onto the site with no floor |
-| `delete`, `restore` | mark a row deleted, or bring it back; a site or floor hides or brings back all it holds |
+| `add_note` | a markdown note with its source, optionally linked to a detail or an area too |
+| `upload_file` | text inline, or binary as base64 up to 25 MiB, optionally linked to a detail or an area too |
+| `import_geojson` | features in any EPSG system as spaces or objects, converted into the site frame, or as areas in WGS 84 |
+| `import_dxf` | a stored DXF drawing onto a floor, onto the site with no floor, or onto a detail in millimetres |
+| `delete`, `restore` | mark a row deleted, or bring it back; a site, floor, detail or area hides or brings back all it holds |
 
 ### Finding things
 
 `find` with `name` matches part of any name a thing goes by: the stored `name`, the attributes `common_name`, `name_en`, `label` and `nickname`, every string in a `nicknames` list, and every outside identifier in `refs`, such as `ha_name`. Case and accents do not matter, and a leading `the `, `il ` or `la ` is ignored on either side, so `snug` finds a room whose `common_name` is `the snug` and `citta` finds `Città`. Hits are ranked: an exact match on any field, then one that starts with the query, then one that contains it, with ties by name, and `limit` applies after ranking. Each hit names the field that matched in `matched_on`.
 
-`find`, `in_space` and `nearest` return short hits unless asked for `detail: true`: `id`, `kind`, `name`, `site_id`, `floor_id`, `area` for a space, and `placement` and `in_space` for an object. `in_space` is the smallest live space on the object's floor that covers its position (the midpoint of a line, the centroid of anything else). A short `in_space` reply marks a line or area that crosses the space's edge with `partly_outside: true`. With `detail: true` a hit also carries its attributes, outside identifiers and geometry, and `in_space` gives `wholly_inside` for every object. `what_is_at` and `connections` never return geometry. Every JSON reply is sent without indentation.
+`find`, `in_space` and `nearest` return short hits unless asked for `detail: true`: `id`, `kind`, `name`, `site_id`, `floor_id`, `area` for a space, and `placement` and `in_space` for an object. `in_space` is the smallest live space on the object's floor that covers its position (the midpoint of a line, the centroid of anything else). A short `in_space` reply marks a line or area that crosses the space's edge with `partly_outside: true`. An object hit carries `details`, the number of detail drawings of it, and `files`, the number of files linked to it, each only when not zero, so a calling agent knows there is more to look at. `detail: true` asks for the full reply, which is about the reply's length and not about detail drawings: a hit also carries its attributes, outside identifiers and geometry, an object's detail drawings are listed as `details` (`id`, `name`, `view`), and `in_space` gives `wholly_inside` for every object. Without `site_id`, `find` also matches areas by the same names and lists them as `areas`. `what_is_at` and `connections` never return geometry. Every JSON reply is sent without indentation.
 
 ### Placement
 
@@ -89,6 +99,24 @@ An object's `placement` says how its geometry was found: `exact`, where it is; `
 `nearest`, `what_is_at` and `in_space` leave unplaced objects out and count them in `unplaced_omitted`, and every object they return carries `placement`; `nearest` ranks an approximate object like any other, and a distance to it is only as good as its room. `measure` and `nearest` refuse to measure from an unplaced object. `render_plan` does not draw unplaced objects and lists them in the legend as "N items not placed"; it draws approximate ones hollow, keyed in the legend as "position approximate". `find` returns unplaced objects like any other, so they can be found and placed.
 
 Migration 0004 filled `placement` from the `position` attribute that seeded objects carried: `site_unplaced` became `unplaced`, and any other value, such as `room_centre`, `approximate`. The attribute was left as it was, and the migration logs how many objects had each value.
+
+### Levels
+
+The model zooms both ways from site, floor, space and object, and every level is optional.
+
+Below an object, a **detail** is a drawing of it, such as a table seen from the top, or of part of another detail, such as a drawer inside that table, nested to any depth. A detail has its own frame: millimetres, x right, y up, origin at the drawing's lower left, with no relation to the site frame and no georeference. It carries labelled parts (`upsert_detail_part`), linework (`import_dxf` with `detail_id`, converted to millimetres from the drawing's unit, with layers mapped to `part` becoming parts), optional `measurements` (`width`, `depth` and `height`, each with its `source`: `measured`, `from_drawing` or `estimated`), and files and notes. A detail's optional `placement` (`x`, `y` in its parent's frame and units, `rotation`, `scale`) says where it lies in its parent; without one it is linked to the parent but not drawn in it. No floor or site query reads a detail: `what_is_at`, `nearest`, `in_space`, `measure`, `connections`, `get_floor` and floor and site plans answer as if there were none. `find`, `in_space` and `nearest` only count an object's details.
+
+Above a site, an **area** is a neighbourhood, hamlet, town, municipality, valley or region (any lowercase `kind`), optionally inside another area, nested to any depth, with an optional outline stored in WGS 84 as given. A site is in the area its `area_id` names (`create_site`, `set_site_area`), or, with no `area_id`, in the smallest live area whose outline covers its origin. `list_sites` and `context` report which rule applied, as `via`: `area_id` or `origin`. `import_geojson` with `as: area` brings a boundary from a geoportal in directly.
+
+`context` takes one of `area_id`, `site_id`, `floor_id`, `space_id`, `object_id` or `detail_id` and returns `up`, the chain from that row to the outermost area (a detail goes through the details it is inside, its object, the smallest space covering the object, the floor, the site and the areas), and `down`, the direct children by kind with counts. Each step says whether it is `placed` in its parent: a detail with a placement, an object that is not `unplaced`, a georeferenced site, an area with an outline.
+
+`render_plan` draws each level. With `detail_id`, a detail's linework and labelled parts, its placed child details as dashed outlines, dimension lines from its measurements (an estimated value is marked `~`), and a scale bar in millimetres or centimetres, with no north arrow. With `area_id`, an area's outline and those of the areas directly inside it, and each georeferenced site in it as its parcel and building outlines carried out of the site frame into UTM zone 32N, labelled, with a scale bar and north arrow; a site with no georeference is listed in the legend. Floor and site plans are unchanged.
+
+Deleting a detail hides its parts, linework and the details inside it, and deleting an area hides the areas inside it, through the live views; nothing cascades, and restoring brings it all back.
+
+### Viewing files
+
+`get_file` says in `content_kind` how it returns a file. `text`: UTF-8 text of at most 1 MiB, in `content`. `image`: a PNG, JPEG or WebP, as MCP image content no larger than 2000 pixels on its long side, scaled down when larger. `pdf_page`: one page of a PDF (`page`, from 1, default 1), drawn to a PNG about 2000 pixels on its long side, with `page_count`. PDF pages are drawn by [hayro](https://github.com/LaurenzV/hayro), a PDF rasterizer written in Rust, so the image needs no system library. `none`: any other file, or one that cannot be read, with `content` null and a `content_note` saying why when there is a reason to give.
 
 ### Updating part of a row
 
@@ -116,7 +144,9 @@ With `floor_id` the drawing goes onto that floor. With `site_id` and no `floor_i
 
 Units come from the drawing's `$INSUNITS` header. A drawing with no unit there is refused unless the call gives `unit`, which also overrides the header when both are present. An optional `transform` scales, rotates (degrees counterclockwise) and offsets the drawing after the unit conversion. The result reports counts per layer, the spaces and objects made, outlines PostGIS found invalid, and every entity skipped with the reason.
 
-Importing the same file content onto the same floor, or onto the same site with no floor, again marks the earlier import and everything it made as deleted, then imports afresh. A DWG file can be stored but not imported; convert it to DXF with the free ODA File Converter first.
+With `detail_id` alone it goes onto a detail: the drawing is converted to millimetres from its unit, its linework is kept for that detail only, and closed polylines on a layer mapped to `part`, such as `{"PARTS": {"part": "panel"}}`, become the detail's parts, each named by the tallest text inside it or by the mapped word and a number. A `transform` offset on a detail is in millimetres.
+
+Importing the same file content onto the same floor, onto the same site with no floor, or onto the same detail, again marks the earlier import and everything it made as deleted, then imports afresh. A DWG file can be stored but not imported; convert it to DXF with the free ODA File Converter first.
 
 ### Plan labels
 
@@ -188,6 +218,7 @@ The first lists every opening touching the space with its `opening_type` and the
 | file through a tool call | 25 MiB |
 | request body through HTTP, which for an upload is the file | 100 MiB plus 64 KiB |
 | stored file an import reads (DXF or GeoJSON) | 16 MiB |
+| stored image or PDF `get_file` shows | 64 MiB; an image larger than 30,000 pixels on a side is not decoded |
 | DXF entities, counting every copy a block expands to | 100,000 |
 | DXF vertices, counted the same way | 2,000,000 |
 | DXF block nesting | 16 levels; a block that inserts itself is refused |
@@ -201,7 +232,7 @@ The first lists every opening touching the space with its `opening_type` and the
 | --- | --- | --- |
 | `GET /healthz` | none | 200 when the database answers; 503 while it does not, and while the server is still connecting at start |
 | `POST /mcp` | bearer | MCP over streamable HTTP, stateless |
-| `POST /api/files?name=...` | bearer, read and write | stores the request body; `Content-Type` is the media type; optional `reason`, `site_id`, `floor_id`, `space_id`, `object_id` |
+| `POST /api/files?name=...` | bearer, read and write | stores the request body; `Content-Type` is the media type; optional `reason`, `site_id`, `floor_id`, `space_id`, `object_id`, `detail_id`, `area_id` |
 | `GET /api/files/<sha256>` | bearer | the file, as an attachment |
 | `GET /` and `POST /` | basic, with the read and write token as the password | a page listing files with an upload form, for a phone |
 | `GET /files/<sha256>` | basic, as above | the file, as an attachment |

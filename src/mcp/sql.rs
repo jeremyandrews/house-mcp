@@ -88,3 +88,21 @@ macro_rules! name_match {
         )
     };
 }
+
+/// Lateral joins giving `detail_count` and `detail_list`, the live details
+/// drawn directly of an object (`{id, name, view}` each), and `file_count`,
+/// the live files linked to it.
+macro_rules! object_levels_join {
+    ($object:literal) => {
+        concat!(
+            " LEFT JOIN LATERAL (SELECT count(*) AS detail_count,
+                     coalesce(jsonb_agg(jsonb_build_object('id', d.id, 'name', d.name, 'view', d.view) ORDER BY d.name, d.id), '[]') AS detail_list
+                 FROM live_detail d WHERE d.object_id = ",
+            $object,
+            ".id) AS levels ON true
+             LEFT JOIN LATERAL (SELECT count(*) AS file_count FROM file f WHERE f.deleted_at IS NULL AND f.object_id = ",
+            $object,
+            ".id) AS files ON true "
+        )
+    };
+}

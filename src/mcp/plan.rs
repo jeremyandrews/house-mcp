@@ -9,24 +9,34 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::{Row, postgres::PgRow};
 
 use super::House;
 use crate::{
     error,
-    render::{self, Extent, Feature, Label, LabelSize, MAX_SIDE_PX, MIN_SIDE_PX, Plan, Style, Symbol},
+    render::{
+        self, Axis, Dimension, Extent, Feature, FrameUnit, Label, LabelSize, MAX_SIDE_PX, MIN_SIDE_PX, Plan, Sheet,
+        Style, Symbol,
+    },
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RenderPlanParams {
-    pub site_id: i64,
+    /// The site whose floor or outdoors to draw. Not used with `detail_id`
+    /// or `area_id`.
+    pub site_id: Option<i64>,
     /// Omit to draw the site: outdoor spaces and objects.
     pub floor_id: Option<i64>,
+    /// Draw this detail (a drawing of an object, in millimetres) instead of
+    /// a floor or site.
+    pub detail_id: Option<i64>,
+    /// Draw this area around sites instead of a floor or site.
+    pub area_id: Option<i64>,
     #[serde(default)]
     pub layers: Layers,
-    /// Spaces and objects to draw in a highlight colour, such as
-    /// `[{"object": 12}, {"space": 3}]`.
+    /// Spaces, objects or detail parts to draw in a highlight colour, such
+    /// as `[{"object": 12}, {"space": 3}]` or `[{"part": 5}]`.
     #[serde(default)]
     pub highlight: Vec<Highlight>,
     /// Pixels on the long side. Default 1600, from 200 to 4096.
@@ -96,12 +106,13 @@ impl Default for Layers {
 pub enum Highlight {
     Space(i64),
     Object(i64),
+    Part(i64),
 }
 
 #[tool_router(router = plan_router, vis = "pub(super)")]
 impl House {
     #[tool(
-        description = "Draw a floor, or the site's outdoor areas with no `floor_id`, as a plan with a scale bar and north arrow. Returns a PNG to look at and a short JSON summary (size in pixels, and the legend); the SVG the PNG was drawn from comes too only with `include_svg: true`. Each space and object is labelled from the first attribute named in `label_from` that holds a non-empty string, by default `common_name` (the family's nickname) and then `name_en`, with a leading \"the \" dropped and the first letter capitalized; without one it uses the row's `name` as stored. Pass `label_from: []` to label everything by `name`. Labels never overlap and are never cut short: highlighted features are placed first, then spaces from the largest, then objects; each label tries its anchor, then eight spots around it, then smaller type, and a label with no room at all becomes a small numbered marker by its feature with its text in a legend beside the scale bar. A space's label always covers part of its space. `label_size` is `small`, `normal` or `large`. Objects of kind `opening` cut a gap through the floor's walls at render time, with jamb ticks either side, and are drawn by `opening_type`: an `arch` as two dashed lines across the gap along the wall's faces, a `door` as its leaf square to the wall with the quarter circle of its swing, an `opening` as the gap alone. The stored linework never changes. Without `floor_id`, linework imported onto the site with no floor is drawn. An object whose position is not known (`placement: unplaced`) is not drawn: the legend says how many, as \"N items not placed\", and the summary gives the count as `not_placed`. An object placed only near where it is (`placement: approximate`, such as at the middle of its room) is drawn hollow, with a dashed outline, and the legend keys that style as \"position approximate\". The summary lists those legend lines in `notes`."
+        description = "Draw one level of the model as a plan. With `site_id` and `floor_id`, a floor; with `site_id` alone, the site's outdoor spaces and objects; both with a scale bar in metres and a north arrow. With `detail_id` alone, a detail (a drawing of an object, from upsert_detail) in its own millimetre frame: its linework and labelled parts, the details inside it that have a placement drawn in place as dashed outlines (the legend counts those without one), dimension lines from its measurements (width and depth for a top view, width and height from the front, depth and height from the side; an estimated value is marked `~`), a scale bar in millimetres or centimetres and no north arrow; `layers.linework` and `layers.spaces` turn its linework and its parts off. With `area_id` alone, an area around sites (from upsert_area), in UTM zone 32N metres with north up: its outline, the outlines of the areas directly inside it, and each georeferenced site in it or in an area inside it, drawn as its parcel and building outlines and labelled with its name; a site with no georeference is listed in the legend instead. A floor or site plan never shows a detail or an area. context says which ids exist at each level. Returns a PNG to look at and a short JSON summary (size in pixels, and the legend); the SVG the PNG was drawn from comes too only with `include_svg: true`. Each space and object is labelled from the first attribute named in `label_from` that holds a non-empty string, by default `common_name` (the family's nickname) and then `name_en`, with a leading \"the \" dropped and the first letter capitalized; without one it uses the row's `name` as stored. Pass `label_from: []` to label everything by `name`. Labels never overlap and are never cut short: highlighted features are placed first, then spaces from the largest, then objects; each label tries its anchor, then eight spots around it, then smaller type, and a label with no room at all becomes a small numbered marker by its feature with its text in a legend beside the scale bar. A space's label always covers part of its space. `label_size` is `small`, `normal` or `large`. Objects of kind `opening` cut a gap through the floor's walls at render time, with jamb ticks either side, and are drawn by `opening_type`: an `arch` as two dashed lines across the gap along the wall's faces, a `door` as its leaf square to the wall with the quarter circle of its swing, an `opening` as the gap alone. The stored linework never changes. Without `floor_id`, linework imported onto the site with no floor is drawn. An object whose position is not known (`placement: unplaced`) is not drawn: the legend says how many, as \"N items not placed\", and the summary gives the count as `not_placed`. An object placed only near where it is (`placement: approximate`, such as at the middle of its room) is drawn hollow, with a dashed outline, and the legend keys that style as \"position approximate\". The summary lists those legend lines in `notes`."
     )]
     async fn render_plan(&self, Parameters(p): Parameters<RenderPlanParams>) -> Result<CallToolResult, ErrorData> {
         let size = p.size.unwrap_or(1600);
@@ -111,11 +122,29 @@ impl House {
                 format!("must be between {MIN_SIDE_PX} and {MAX_SIDE_PX}"),
             ));
         }
+        match (p.detail_id, p.area_id) {
+            (Some(_), Some(_)) => return Err(error::invalid("area_id", "give detail_id or area_id, not both")),
+            (Some(_), None) | (None, Some(_)) if p.site_id.is_some() || p.floor_id.is_some() => {
+                return Err(error::invalid(
+                    "site_id",
+                    "a detail or area is drawn on its own; leave out site_id and floor_id",
+                ));
+            }
+            (Some(detail), None) => return self.render_detail(detail, &p, size).await,
+            (None, Some(area)) => return self.render_area(area, &p, size).await,
+            (None, None) => {}
+        }
+        let site_id = p.site_id.ok_or_else(|| {
+            error::invalid(
+                "site_id",
+                "give site_id, with floor_id for a floor, or detail_id, or area_id",
+            )
+        })?;
         let site = sqlx::query(
             "SELECT s.name, s.rotation, f.name AS floor FROM site s LEFT JOIN live_floor f ON f.id = $2 AND f.site_id = s.id
              WHERE s.id = $1 AND s.deleted_at IS NULL",
         )
-        .bind(p.site_id)
+        .bind(site_id)
         .bind(p.floor_id)
         .fetch_optional(&self.db)
         .await
@@ -131,20 +160,22 @@ impl House {
             None => DEFAULT_LABEL_FROM.map(String::from).to_vec(),
         };
         let openings = match p.floor_id {
-            Some(floor_id) => self.openings(p.site_id, floor_id).await?,
+            Some(floor_id) => self.openings(site_id, floor_id).await?,
             None => Vec::new(),
         };
         let mut features = Vec::new();
         let mut not_placed = 0;
         if p.layers.linework {
-            features.extend(self.linework_features(p.site_id, p.floor_id, &openings).await?);
+            features.extend(self.linework_features(site_id, p.floor_id, &openings).await?);
         }
         if p.layers.spaces {
-            features.extend(self.space_features(&p, &highlight, &label_from).await?);
+            features.extend(self.space_features(site_id, &p, &highlight, &label_from).await?);
         }
         if p.layers.objects.as_ref().is_none_or(|kinds| !kinds.is_empty()) {
             let cutting: HashSet<i64> = openings.iter().map(|o| o.id).collect();
-            let (objects, unplaced) = self.object_features(&p, &highlight, &label_from, &cutting).await?;
+            let (objects, unplaced) = self
+                .object_features(site_id, &p, &highlight, &label_from, &cutting)
+                .await?;
             features.extend(objects);
             not_placed = unplaced;
             if p.layers
@@ -183,29 +214,45 @@ impl House {
             features,
             label_size: p.label_size,
             not_placed,
+            sheet: Sheet::default(),
         };
-        let rendered = tokio::task::spawn_blocking(move || render::render(&plan, size))
-            .await
-            .map_err(|e| error::internal("rendering a plan", e))?
-            .map_err(|e| error::internal("rendering a plan", e))?;
-        let summary = json!({
-            "width": rendered.width,
-            "height": rendered.height,
-            "legend": rendered.legend.iter().enumerate()
-                .map(|(i, text)| json!({ "marker": i + 1, "label": text }))
-                .collect::<Vec<_>>(),
-            "not_placed": not_placed,
-            "notes": rendered.notes,
-        });
-        let mut content = vec![
-            ContentBlock::image(STANDARD.encode(&rendered.png), "image/png"),
-            ContentBlock::text(summary.to_string()),
-        ];
-        if p.include_svg {
-            content.push(ContentBlock::text(rendered.svg));
-        }
-        Ok(CallToolResult::success(content))
+        draw(plan, size, p.include_svg, Map::new()).await
     }
+}
+
+/// Renders a plan, returning its PNG and a short summary, with `extra`
+/// fields added to the summary, and the SVG when asked for.
+async fn draw(
+    plan: Plan,
+    size: u32,
+    include_svg: bool,
+    extra: Map<String, Value>,
+) -> Result<CallToolResult, ErrorData> {
+    let not_placed = plan.not_placed;
+    let rendered = tokio::task::spawn_blocking(move || render::render(&plan, size))
+        .await
+        .map_err(|e| error::internal("rendering a plan", e))?
+        .map_err(|e| error::internal("rendering a plan", e))?;
+    let mut summary = json!({
+        "width": rendered.width,
+        "height": rendered.height,
+        "legend": rendered.legend.iter().enumerate()
+            .map(|(i, text)| json!({ "marker": i + 1, "label": text }))
+            .collect::<Vec<_>>(),
+        "not_placed": not_placed,
+        "notes": rendered.notes,
+    });
+    for (key, value) in extra {
+        summary[key] = value;
+    }
+    let mut content = vec![
+        ContentBlock::image(STANDARD.encode(&rendered.png), "image/png"),
+        ContentBlock::text(summary.to_string()),
+    ];
+    if include_svg {
+        content.push(ContentBlock::text(rendered.svg));
+    }
+    Ok(CallToolResult::success(content))
 }
 
 impl House {
@@ -302,6 +349,7 @@ impl House {
 
     async fn space_features(
         &self,
+        site_id: i64,
         p: &RenderPlanParams,
         highlight: &HashSet<Highlight>,
         label_from: &[String],
@@ -310,7 +358,7 @@ impl House {
             "SELECT id, name, kind, attributes, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
              FROM live_space WHERE site_id = $1 AND floor_id IS NOT DISTINCT FROM $2",
         )
-        .bind(p.site_id)
+        .bind(site_id)
         .bind(p.floor_id)
         .fetch_all(&self.db)
         .await
@@ -328,6 +376,7 @@ impl House {
 
     async fn object_features(
         &self,
+        site_id: i64,
         p: &RenderPlanParams,
         highlight: &HashSet<Highlight>,
         label_from: &[String],
@@ -338,7 +387,7 @@ impl House {
              FROM live_object WHERE site_id = $1 AND floor_id IS NOT DISTINCT FROM $2
                AND ($3::text[] IS NULL OR kind = ANY($3))",
         )
-        .bind(p.site_id)
+        .bind(site_id)
         .bind(p.floor_id)
         .bind(&p.layers.objects)
         .fetch_all(&self.db)
@@ -376,6 +425,410 @@ impl House {
         .await
         .map_err(error::db)?;
         Ok(Extent { xmin, ymin, xmax, ymax })
+    }
+}
+
+/// The measurements a view shows across and up its drawing: width and depth
+/// from the top (and in a section, an exploded view or another view), width
+/// and height from the front, depth and height from the side.
+fn view_axes(view: &str) -> (&'static str, &'static str) {
+    match view {
+        "front" => ("width", "height"),
+        "side" => ("depth", "height"),
+        _ => ("width", "depth"),
+    }
+}
+
+/// A measurement in millimetres as a dimension reads, `~` before an
+/// estimated one.
+fn measurement_text(measurement: &Value) -> Option<(f64, String)> {
+    let value = measurement.get("value")?.as_f64()?;
+    let number = if (value - value.round()).abs() < 1e-9 {
+        format!("{value:.0}")
+    } else {
+        format!("{value}")
+    };
+    let mark = if measurement.get("source").and_then(Value::as_str) == Some("estimated") {
+        "~"
+    } else {
+        ""
+    };
+    Some((value, format!("{mark}{number} mm")))
+}
+
+impl House {
+    /// A detail in its own frame: its linework and parts, the details inside
+    /// it that have a placement drawn in place as outlines, and dimension
+    /// lines from its measurements.
+    async fn render_detail(
+        &self,
+        detail_id: i64,
+        p: &RenderPlanParams,
+        size: u32,
+    ) -> Result<CallToolResult, ErrorData> {
+        let detail = sqlx::query("SELECT id, name, view, measurements FROM live_detail WHERE id = $1")
+            .bind(detail_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(error::db)?
+            .ok_or_else(|| error::invalid("detail_id", "no live detail with this id"))?;
+        let view: String = detail.get("view");
+        let measurements: Option<Value> = detail.get("measurements");
+        let highlight: HashSet<Highlight> = p.highlight.iter().copied().collect();
+        let label_from = label_keys(p);
+        let mut features = Vec::new();
+        if p.layers.linework {
+            let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT ST_AsBinary(geom) FROM detail_linework WHERE detail_id = $1 AND deleted_at IS NULL AND text IS NULL",
+            )
+            .bind(detail_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(error::db)?;
+            features.extend(rows.into_iter().map(|wkb| Feature {
+                wkb,
+                style: Style::Linework,
+                label: None,
+                highlight: false,
+            }));
+        }
+        let mut notes = Vec::new();
+        if p.layers.spaces {
+            let parts = sqlx::query(
+                "SELECT id, name, attributes, ST_AsBinary(geom) AS wkb, ST_X(ST_PointOnSurface(geom)) AS lx, ST_Y(ST_PointOnSurface(geom)) AS ly
+                 FROM live_detail_part WHERE detail_id = $1 ORDER BY id",
+            )
+            .bind(detail_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(error::db)?;
+            features.extend(parts.iter().map(|r| Feature {
+                wkb: r.get("wkb"),
+                style: Style::Part,
+                label: label(r, p.layers.labels, &label_from),
+                highlight: highlight.contains(&Highlight::Part(r.get("id"))),
+            }));
+            // Each child's own drawing, or else the box its measurements
+            // give, carried into this frame by its placement.
+            let children = sqlx::query(
+                "SELECT c.id, c.name, c.attributes, c.placement IS NOT NULL AS placed,
+                        ST_AsBinary(placed.geom) AS wkb, ST_X(ST_PointOnSurface(placed.geom)) AS lx,
+                        ST_Y(ST_PointOnSurface(placed.geom)) AS ly
+                 FROM live_detail c
+                 CROSS JOIN LATERAL (
+                     SELECT ST_Envelope(ST_Collect(g.geom)) AS geom FROM (
+                         SELECT geom FROM live_detail_part WHERE detail_id = c.id
+                         UNION ALL
+                         SELECT geom FROM detail_linework WHERE detail_id = c.id AND deleted_at IS NULL AND text IS NULL
+                     ) AS g
+                 ) AS own
+                 CROSS JOIN LATERAL (
+                     SELECT coalesce(own.geom, ST_MakeEnvelope(0, 0,
+                                (c.measurements -> (CASE c.view WHEN 'side' THEN 'depth' ELSE 'width' END) ->> 'value')::float8,
+                                (c.measurements -> (CASE WHEN c.view IN ('front', 'side') THEN 'height' ELSE 'depth' END) ->> 'value')::float8
+                            )) AS geom
+                 ) AS drawn
+                 CROSS JOIN LATERAL (
+                     SELECT ST_Translate(
+                                ST_Rotate(
+                                    ST_Scale(drawn.geom, coalesce((c.placement ->> 'scale')::float8, 1), coalesce((c.placement ->> 'scale')::float8, 1)),
+                                    radians(coalesce((c.placement ->> 'rotation')::float8, 0))
+                                ),
+                                (c.placement ->> 'x')::float8, (c.placement ->> 'y')::float8
+                            ) AS geom
+                 ) AS placed
+                 WHERE c.parent_detail_id = $1 ORDER BY c.id",
+            )
+            .bind(detail_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(error::db)?;
+            let mut unplaced = 0;
+            let mut empty = 0;
+            for r in &children {
+                if !r.get::<bool, _>("placed") {
+                    unplaced += 1;
+                    continue;
+                }
+                let Some(wkb) = r.get::<Option<Vec<u8>>, _>("wkb") else {
+                    empty += 1;
+                    continue;
+                };
+                features.push(Feature {
+                    wkb,
+                    style: Style::Outline,
+                    label: label(r, p.layers.labels, &label_from),
+                    highlight: false,
+                });
+            }
+            if unplaced > 0 {
+                notes.push(format!(
+                    "{unplaced} detail{} inside, not placed",
+                    if unplaced == 1 { "" } else { "s" }
+                ));
+            }
+            if empty > 0 {
+                notes.push(format!(
+                    "{empty} detail{} inside with nothing to draw",
+                    if empty == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        // Dimensions start at the lower left of the detail's own drawing,
+        // or at its origin when it has none, where an outline of the
+        // measured size stands in.
+        let (across_key, up_key) = view_axes(&view);
+        let measured = |key: &str| {
+            measurements
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(measurement_text)
+        };
+        let (across, up) = (measured(across_key), measured(up_key));
+        let own: Option<(f64, f64)> = sqlx::query_as(
+            "SELECT ST_XMin(e), ST_YMin(e) FROM (
+                 SELECT ST_Extent(g.geom) AS e FROM (
+                     SELECT geom FROM live_detail_part WHERE detail_id = $1
+                     UNION ALL
+                     SELECT geom FROM detail_linework WHERE detail_id = $1 AND deleted_at IS NULL AND text IS NULL
+                 ) AS g
+             ) AS x WHERE e IS NOT NULL",
+        )
+        .bind(detail_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(error::db)?;
+        let (x0, y0) = own.unwrap_or((0.0, 0.0));
+        if own.is_none()
+            && let (Some((w, _)), Some((h, _))) = (&across, &up)
+        {
+            let ring =
+                json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [w, 0.0], [w, h], [0.0, h], [0.0, 0.0]]]});
+            features.push(Feature {
+                wkb: crate::geom::to_wkb(&ring).map_err(|e| error::internal("encoding an outline", e))?,
+                style: Style::Outline,
+                label: None,
+                highlight: false,
+            });
+            notes.push("outline from the measurements; nothing drawn yet".to_owned());
+        }
+        if features.is_empty() {
+            return Err(error::invalid(
+                "detail_id",
+                "nothing to draw on this detail: add parts with upsert_detail_part, import a drawing with import_dxf, or give it measurements",
+            ));
+        }
+        let mut dimensions = Vec::new();
+        if let Some((value, text)) = &across {
+            dimensions.push(Dimension {
+                axis: Axis::X,
+                from: x0,
+                to: x0 + value,
+                edge: y0,
+                text: format!("{across_key} {text}"),
+            });
+        }
+        if let Some((value, text)) = &up {
+            dimensions.push(Dimension {
+                axis: Axis::Y,
+                from: y0,
+                to: y0 + value,
+                edge: x0,
+                text: format!("{up_key} {text}"),
+            });
+        }
+        let mut extent = self.extent(&features).await?;
+        for d in &dimensions {
+            match d.axis {
+                Axis::X => {
+                    extent.xmin = extent.xmin.min(d.from);
+                    extent.xmax = extent.xmax.max(d.to);
+                }
+                Axis::Y => {
+                    extent.ymin = extent.ymin.min(d.from);
+                    extent.ymax = extent.ymax.max(d.to);
+                }
+            }
+        }
+        let path = self.detail_path(detail_id).await?;
+        let names: Vec<&str> = path.iter().rev().filter_map(|step| step["name"].as_str()).collect();
+        let dimension_texts: Vec<String> = dimensions.iter().map(|d| d.text.clone()).collect();
+        let plan = Plan {
+            title: format!("{} ({view})", names.join(", ")),
+            rotation: 0.0,
+            extent,
+            features,
+            label_size: p.label_size,
+            not_placed: 0,
+            sheet: Sheet {
+                unit: FrameUnit::Millimetres,
+                no_north_arrow: true,
+                dimensions,
+                notes,
+            },
+        };
+        let mut extra = Map::new();
+        extra.insert("frame".into(), json!("millimetres"));
+        extra.insert("dimensions".into(), json!(dimension_texts));
+        draw(plan, size, p.include_svg, extra).await
+    }
+
+    /// An area in UTM zone 32N, north up: its outline, the outlines of the
+    /// areas directly inside it, and each georeferenced site in it or in an
+    /// area inside it, as its parcel and building outlines carried out of the
+    /// site frame. A site with no georeference is listed in the legend.
+    async fn render_area(&self, area_id: i64, p: &RenderPlanParams, size: u32) -> Result<CallToolResult, ErrorData> {
+        let area = sqlx::query(
+            "SELECT id, name, kind, attributes, ST_AsBinary(ST_Transform(geom, 32632)) AS wkb FROM live_area WHERE id = $1",
+        )
+        .bind(area_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(error::db)?
+        .ok_or_else(|| error::invalid("area_id", "no live area with this id"))?;
+        let label_from = label_keys(p);
+        let mut features = Vec::new();
+        if let Some(wkb) = area.get::<Option<Vec<u8>>, _>("wkb") {
+            features.push(Feature {
+                wkb,
+                style: Style::Outline,
+                label: None,
+                highlight: false,
+            });
+        }
+        // An area inside is labelled near the top of its outline, where its
+        // name stays clear of the sites in it.
+        let children = sqlx::query(
+            "SELECT id, name, attributes, ST_AsBinary(g) AS wkb, ST_X(top) AS lx, ST_Y(top) AS ly
+             FROM live_area CROSS JOIN LATERAL ST_Transform(geom, 32632) AS g
+             CROSS JOIN LATERAL ST_ClosestPoint(g, ST_SetSRID(ST_MakePoint(ST_X(ST_Centroid(g)), ST_YMax(g) - 0.06 * (ST_YMax(g) - ST_YMin(g))), 32632)) AS top
+             WHERE parent_area_id = $1 AND geom IS NOT NULL ORDER BY name, id",
+        )
+        .bind(area_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(error::db)?;
+        features.extend(children.iter().map(|r| Feature {
+            wkb: r.get("wkb"),
+            style: Style::Outline,
+            label: label(r, p.layers.labels, &label_from),
+            highlight: false,
+        }));
+        let sites = sqlx::query(
+            "WITH RECURSIVE inside(id) AS (
+                 SELECT $1::bigint
+                 UNION
+                 SELECT a.id FROM live_area a JOIN inside ON a.parent_area_id = inside.id
+             )
+             SELECT s.id, s.name, s.attributes, s.origin IS NOT NULL AS georeferenced,
+                    ST_AsBinary(ST_Transform(s.origin, 32632)) AS origin_wkb,
+                    ST_X(s.origin) AS lx, ST_Y(s.origin) AS ly
+             FROM site s CROSS JOIN LATERAL house_site_area(s.id) AS sa
+             WHERE s.deleted_at IS NULL AND sa.area_id IN (SELECT id FROM inside)
+             ORDER BY s.name, s.id",
+        )
+        .bind(area_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(error::db)?;
+        let mut notes = Vec::new();
+        let mut drawn_sites = Vec::new();
+        let mut not_drawn = Vec::new();
+        for site in &sites {
+            let name: String = site.get("name");
+            if !site.get::<bool, _>("georeferenced") {
+                notes.push(format!("not drawn, no georeference: {name}"));
+                not_drawn.push(json!({ "id": site.get::<i64, _>("id"), "name": name }));
+                continue;
+            }
+            let site_id: i64 = site.get("id");
+            let outlines = sqlx::query(
+                "SELECT kind, ST_AsBinary(g) AS wkb, ST_X(ST_PointOnSurface(g)) AS lx, ST_Y(ST_PointOnSurface(g)) AS ly
+                 FROM live_space CROSS JOIN LATERAL house_from_local(geom, site_id, 32632) AS g
+                 WHERE site_id = $1 AND floor_id IS NULL AND kind IN ('parcel', 'building')
+                 ORDER BY kind DESC, id",
+            )
+            .bind(site_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(error::db)?;
+            let site_label = |x: f64, y: f64| {
+                p.layers.labels.then(|| Label {
+                    text: label_text(name.clone(), &site.get::<Value, _>("attributes"), &label_from),
+                    x,
+                    y,
+                })
+            };
+            let mut labelled = false;
+            for outline in &outlines {
+                let kind: String = outline.get("kind");
+                let anchor = (outline.get::<Option<f64>, _>("lx"), outline.get::<Option<f64>, _>("ly"));
+                let label = match anchor {
+                    (Some(x), Some(y)) if kind == "parcel" && !labelled => {
+                        labelled = true;
+                        site_label(x, y)
+                    }
+                    _ => None,
+                };
+                features.push(Feature {
+                    wkb: outline.get("wkb"),
+                    style: Style::Space { kind },
+                    label,
+                    highlight: false,
+                });
+            }
+            if outlines.is_empty() {
+                // No outline to draw: the site's origin stands for it.
+                let origin: Vec<u8> = site.get("origin_wkb");
+                let (x, y): (f64, f64) = sqlx::query_as("SELECT ST_X(g), ST_Y(g) FROM ST_GeomFromWKB($1) AS g")
+                    .bind(&origin)
+                    .fetch_one(&self.db)
+                    .await
+                    .map_err(error::db)?;
+                features.push(Feature {
+                    wkb: origin,
+                    style: Style::Object {
+                        kind: "site".into(),
+                        approximate: false,
+                    },
+                    label: site_label(x, y),
+                    highlight: false,
+                });
+            }
+            drawn_sites.push(json!({ "id": site_id, "name": name, "outlines": outlines.len() }));
+        }
+        if features.is_empty() {
+            return Err(error::invalid(
+                "area_id",
+                "nothing to draw: the area has no outline, no outlined areas inside it and no georeferenced site",
+            ));
+        }
+        let extent = self.extent(&features).await?;
+        let plan = Plan {
+            title: format!("{} ({})", area.get::<String, _>("name"), area.get::<String, _>("kind")),
+            rotation: 0.0,
+            extent,
+            features,
+            label_size: p.label_size,
+            not_placed: 0,
+            sheet: Sheet {
+                notes,
+                ..Sheet::default()
+            },
+        };
+        let mut extra = Map::new();
+        extra.insert("frame".into(), json!("UTM zone 32N, metres, north up"));
+        extra.insert("sites".into(), json!(drawn_sites));
+        extra.insert("not_drawn".into(), json!(not_drawn));
+        draw(plan, size, p.include_svg, extra).await
+    }
+}
+
+/// The label keys a call asks for, or the defaults.
+fn label_keys(p: &RenderPlanParams) -> Vec<String> {
+    match &p.label_from {
+        Some(keys) => keys.clone(),
+        None => DEFAULT_LABEL_FROM.map(String::from).to_vec(),
     }
 }
 
@@ -474,6 +927,22 @@ mod tests {
         let skipped = json!({"common_name": 4, "name_en": "  "});
         assert_eq!(label_text("studio".into(), &skipped, &defaults), "studio");
         assert_eq!(label_text("the studio".into(), &both, &[]), "the studio");
+    }
+
+    #[test]
+    fn measurements_read_with_their_unit_and_an_estimate_marked() {
+        assert_eq!(
+            measurement_text(&json!({"value": 2400, "source": "measured"})),
+            Some((2400.0, "2400 mm".to_owned()))
+        );
+        assert_eq!(
+            measurement_text(&json!({"value": 720.5, "source": "estimated"})),
+            Some((720.5, "~720.5 mm".to_owned()))
+        );
+        assert_eq!(measurement_text(&json!({"source": "measured"})), None);
+        assert_eq!(view_axes("top"), ("width", "depth"));
+        assert_eq!(view_axes("front"), ("width", "height"));
+        assert_eq!(view_axes("side"), ("depth", "height"));
     }
 
     #[test]

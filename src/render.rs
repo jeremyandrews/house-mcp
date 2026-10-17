@@ -59,6 +59,13 @@ const MARKER_REACH: u32 = 6;
 const HALO: f64 = 3.0;
 /// The most of the long side a legend takes from the plan.
 const MAX_FOOTER_SHARE: f64 = 0.4;
+/// A detail part's fill and outline.
+const PART_FILL: &str = "#dfe7f1";
+const PART_STROKE: &str = "#3f5873";
+/// The dashes of an outline: a placed child detail, or an area.
+const OUTLINE_DASHES: &str = "6 4";
+/// How far a dimension line stands off the drawing, in pixels.
+const DIMENSION_OFFSET: f64 = 16.0;
 
 pub struct Plan {
     pub title: String,
@@ -70,6 +77,53 @@ pub struct Plan {
     /// Objects left off the plan because their position is not known. When
     /// there are any, the legend says how many.
     pub not_placed: usize,
+    /// The frame's unit, dimensions and extra legend lines. The default is a
+    /// site plan's.
+    pub sheet: Sheet,
+}
+
+/// What a plan's frame is and what is drawn round it besides its features.
+#[derive(Debug, Default)]
+pub struct Sheet {
+    /// The frame's unit, which the scale bar is in.
+    pub unit: FrameUnit,
+    /// True for a frame with no north, such as a detail's.
+    pub no_north_arrow: bool,
+    /// Dimension lines drawn beside the drawing.
+    pub dimensions: Vec<Dimension>,
+    /// Lines added to the legend after the others, such as what could not
+    /// be drawn.
+    pub notes: Vec<String>,
+}
+
+/// The unit of the frame a plan is drawn in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameUnit {
+    /// A site frame or a projected one: the scale bar in m, km or cm.
+    #[default]
+    Metres,
+    /// A detail's frame: the scale bar in mm or cm.
+    Millimetres,
+}
+
+/// A dimension line: along x below the drawing, or along y left of it,
+/// standing off the drawing's edge, labelled with a measurement.
+#[derive(Debug, Clone)]
+pub struct Dimension {
+    pub axis: Axis,
+    /// Where the line starts and ends along its axis, in frame units.
+    pub from: f64,
+    pub to: f64,
+    /// The drawing's edge it stands off: its least y for a line along x, its
+    /// least x for a line along y.
+    pub edge: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +179,12 @@ pub enum Style {
         /// drawn hollow, and named in the legend.
         approximate: bool,
     },
+    /// A labelled part of a detail: an area filled pale blue grey, or a line
+    /// or point drawn in its outline colour.
+    Part,
+    /// A dashed outline with no fill, labelled like a space: a child detail
+    /// drawn in its parent, or an area.
+    Outline,
     /// A gap in a wall from one jamb to the other, along the wall's centre
     /// line, in site metres. The linework is cut before it gets here; this
     /// draws the jamb ticks and the opening's symbol.
@@ -219,7 +279,7 @@ pub fn render(plan: &Plan, long_side_px: u32) -> Result<Rendered, String> {
     features.sort_by_key(|f| match (&f.style, f.highlight) {
         (_, true) => 4,
         (Style::Linework, _) => 0,
-        (Style::Space { .. }, _) => 1,
+        (Style::Space { .. } | Style::Part | Style::Outline, _) => 1,
         (Style::Opening { .. }, _) => 2,
         (Style::Object { .. }, _) => 3,
     });
@@ -232,8 +292,15 @@ pub fn render(plan: &Plan, long_side_px: u32) -> Result<Rendered, String> {
     let mut footer = FOOTER;
     let (view, labels, legend) = loop {
         let view = View::new(extent, long_side, footer);
-        let labels = place_labels(&features, &view, factor, &font)?;
-        let legend = Legend::lay_out(&labels, &notes, &view, &plan.title, factor, &font);
+        let mut reserved: Vec<Rect> = plan.sheet.dimensions.iter().map(|d| dimension_box(d, &view)).collect();
+        if !plan.sheet.no_north_arrow {
+            reserved.insert(
+                0,
+                Rect::centred(view.width - MARGIN, ARROW_Y, 2.0 * ARROW_REACH, 2.0 * ARROW_REACH),
+            );
+        }
+        let labels = place_labels(&features, &view, factor, &font, reserved)?;
+        let legend = Legend::lay_out(&labels, &notes, &view, &plan.title, plan.sheet.unit, factor, &font);
         if legend.footer <= footer {
             break (view, labels, legend);
         }
@@ -274,12 +341,17 @@ fn svg(
     for feature in features {
         draw_feature(&mut out, feature, view)?;
     }
+    for dimension in &plan.sheet.dimensions {
+        draw_dimension(&mut out, dimension, view);
+    }
     for placed in labels {
         draw_placed(&mut out, placed, factor);
     }
-    draw_scale_bar(&mut out, view);
+    draw_scale_bar(&mut out, view, plan.sheet.unit);
     legend.draw(&mut out);
-    draw_north_arrow(&mut out, view, plan.rotation);
+    if !plan.sheet.no_north_arrow {
+        draw_north_arrow(&mut out, view, plan.rotation);
+    }
     let _ = write!(
         out,
         r##"<text x="{MARGIN}" y="{}" font-size="14" fill="#333">{}</text>"##,
@@ -313,6 +385,10 @@ fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), 
         }
         (Style::Space { .. }, true) => ("none".to_owned(), HIGHLIGHT.to_owned(), 4.0, 6.0),
         (Style::Object { .. }, true) => (HIGHLIGHT.to_owned(), HIGHLIGHT.to_owned(), 4.0, 9.0),
+        (Style::Part, false) => (PART_FILL.to_owned(), PART_STROKE.to_owned(), 1.5, 4.0),
+        (Style::Part, true) => (HIGHLIGHT.to_owned(), HIGHLIGHT.to_owned(), 3.0, 6.0),
+        (Style::Outline, false) => ("none".to_owned(), "#555".to_owned(), 1.25, 3.0),
+        (Style::Outline, true) => ("none".to_owned(), HIGHLIGHT.to_owned(), 3.0, 6.0),
     };
     // An approximate object is drawn hollow: an outline with no fill, and a
     // dashed line, so it does not pass for a measured position.
@@ -325,6 +401,8 @@ fn draw_feature(out: &mut String, feature: &Feature, view: &View) -> Result<(), 
         };
         let dashes = if hollow {
             format!(r#" stroke-dasharray="{APPROXIMATE_DASHES}""#)
+        } else if matches!(feature.style, Style::Outline) {
+            format!(r#" stroke-dasharray="{OUTLINE_DASHES}""#)
         } else {
             String::new()
         };
@@ -576,13 +654,25 @@ struct Pending<'a> {
 /// anchor, then eight spots one text height around it, at its full size and
 /// then smaller. A label with no spot becomes a numbered marker and a legend
 /// entry. A label is never cut short and never drawn over another.
-fn place_labels(features: &[&Feature], view: &View, factor: f64, font: &Measure) -> Result<Vec<Placed>, String> {
+fn place_labels(
+    features: &[&Feature],
+    view: &View,
+    factor: f64,
+    font: &Measure,
+    reserved: Vec<Rect>,
+) -> Result<Vec<Placed>, String> {
     let mut pending = Vec::new();
     for feature in features {
         let Some(label) = &feature.label else { continue };
         let (object, rings) = match &feature.style {
             Style::Object { .. } => (true, Vec::new()),
-            Style::Space { .. } => (false, Shapes::of(&feature.wkb, view)?.rings),
+            Style::Space { .. } | Style::Outline => (false, Shapes::of(&feature.wkb, view)?.rings),
+            // A part with an area is labelled like a space, a line or point
+            // like an object.
+            Style::Part => {
+                let rings = Shapes::of(&feature.wkb, view)?.rings;
+                (rings.is_empty(), rings)
+            }
             Style::Linework | Style::Opening { .. } => continue,
         };
         let area = rings.iter().map(|ring| ring_area(ring)).sum::<f64>().abs();
@@ -608,10 +698,9 @@ fn place_labels(features: &[&Feature], view: &View, factor: f64, font: &Measure)
         x1: view.width,
         y1: view.height - view.footer,
     };
-    let arrow = Rect::centred(view.width - MARGIN, ARROW_Y, 2.0 * ARROW_REACH, 2.0 * ARROW_REACH);
-    // Labels keep off the arrow and off every object's dot, so no label
-    // hides a symbol.
-    let mut taken: Vec<Rect> = vec![arrow];
+    // Labels keep off the arrow, the dimension lines and every object's dot,
+    // so no label hides a symbol.
+    let mut taken: Vec<Rect> = reserved;
     for feature in features {
         if let Style::Object { .. } = feature.style {
             let radius = if feature.highlight { 9.0 } else { 6.0 };
@@ -852,6 +941,7 @@ fn notes(plan: &Plan) -> Vec<(Key, String)> {
         1 => notes.push((Key::Blank, "1 item not placed".to_owned())),
         n => notes.push((Key::Blank, format!("{n} items not placed"))),
     }
+    notes.extend(plan.sheet.notes.iter().map(|text| (Key::Blank, text.clone())));
     notes
 }
 
@@ -883,6 +973,7 @@ impl Legend {
         notes: &[(Key, String)],
         view: &View,
         title: &str,
+        unit: FrameUnit,
         factor: f64,
         font: &Measure,
     ) -> Self {
@@ -921,7 +1012,7 @@ impl Legend {
         // Beside the scale bar and the title, which stay where they are, or
         // across the whole width above them, whichever needs the shorter
         // footer.
-        let scale_bar = scale_bar_width(view);
+        let scale_bar = scale_bar_width(view, unit);
         let title_width = font.width(title, 14.0);
         let beside = MARGIN + scale_bar.max(title_width) + 2.0 * size;
         let right = view.width - 10.0;
@@ -1047,21 +1138,29 @@ fn wrap(text: &str, room: f64, size: f64, font: &Measure) -> Vec<String> {
     lines
 }
 
-/// The scale bar's length in metres and pixels: a round length about a
+/// The scale bar's length in frame units and pixels: a round length about a
 /// quarter of the plan's width.
 fn scale_bar(view: &View) -> (f64, f64) {
     let target = (view.width - 2.0 * MARGIN - NORTH_COLUMN) / view.scale / 4.0;
-    let metres = round_length(target);
-    (metres, metres * view.scale)
+    let length = round_length(target);
+    (length, length * view.scale)
+}
+
+/// A scale bar's length as its label reads.
+fn format_length(length: f64, unit: FrameUnit) -> String {
+    match unit {
+        FrameUnit::Metres => format_metres(length),
+        FrameUnit::Millimetres => format_millimetres(length),
+    }
 }
 
 /// How far the bar and its length reach right of the margin.
-fn scale_bar_width(view: &View) -> f64 {
-    let (metres, length) = scale_bar(view);
-    length + 8.0 + 7.5 * format_metres(metres).len() as f64
+fn scale_bar_width(view: &View, unit: FrameUnit) -> f64 {
+    let (length, pixels) = scale_bar(view);
+    pixels + 8.0 + 7.5 * format_length(length, unit).len() as f64
 }
 
-fn draw_scale_bar(out: &mut String, view: &View) {
+fn draw_scale_bar(out: &mut String, view: &View, unit: FrameUnit) {
     let (metres, length) = scale_bar(view);
     let (x, y) = (MARGIN, view.height - 34.0);
     let half = length / 2.0;
@@ -1080,8 +1179,82 @@ fn draw_scale_bar(out: &mut String, view: &View) {
         mid = x + half,
         end = x + length + 8.0,
         ty = y + 7.0,
-        label = format_metres(metres),
+        label = format_length(metres, unit),
     );
+}
+
+/// The box a dimension line and its text take, which labels keep off.
+fn dimension_box(dimension: &Dimension, view: &View) -> Rect {
+    match dimension.axis {
+        Axis::X => {
+            let (x0, y) = view.px(dimension.from, dimension.edge);
+            let (x1, _) = view.px(dimension.to, dimension.edge);
+            Rect {
+                x0: x0.min(x1) - 6.0,
+                y0: y,
+                x1: x0.max(x1) + 6.0,
+                y1: y + DIMENSION_OFFSET + 18.0,
+            }
+        }
+        Axis::Y => {
+            let (x, y0) = view.px(dimension.edge, dimension.from);
+            let (_, y1) = view.px(dimension.edge, dimension.to);
+            Rect {
+                x0: x - DIMENSION_OFFSET - 20.0,
+                y0: y0.min(y1) - 6.0,
+                x1: x,
+                y1: y0.max(y1) + 6.0,
+            }
+        }
+    }
+}
+
+/// A dimension line standing off the drawing, with an extension line and an
+/// oblique tick at each end, and its text beside it: below a line along x,
+/// and left of a line along y, reading upwards.
+fn draw_dimension(out: &mut String, dimension: &Dimension, view: &View) {
+    let line = |out: &mut String, a: (f64, f64), b: (f64, f64)| {
+        let _ = write!(
+            out,
+            r##"<line class="dimension" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="#111" stroke-width="0.75"/>"##,
+            a.0, a.1, b.0, b.1
+        );
+    };
+    match dimension.axis {
+        Axis::X => {
+            let (x0, edge) = view.px(dimension.from, dimension.edge);
+            let (x1, _) = view.px(dimension.to, dimension.edge);
+            let y = edge + DIMENSION_OFFSET;
+            for x in [x0, x1] {
+                line(out, (x, edge + 3.0), (x, y + 4.0));
+                line(out, (x - 3.0, y + 3.0), (x + 3.0, y - 3.0));
+            }
+            line(out, (x0, y), (x1, y));
+            let _ = write!(
+                out,
+                r##"<text class="dimension-text" x="{:.2}" y="{:.2}" font-size="12" text-anchor="middle" fill="#111">{}</text>"##,
+                (x0 + x1) / 2.0,
+                y + 14.0,
+                escape(&dimension.text)
+            );
+        }
+        Axis::Y => {
+            let (edge, y0) = view.px(dimension.edge, dimension.from);
+            let (_, y1) = view.px(dimension.edge, dimension.to);
+            let x = edge - DIMENSION_OFFSET;
+            for y in [y0, y1] {
+                line(out, (edge - 3.0, y), (x - 4.0, y));
+                line(out, (x - 3.0, y + 3.0), (x + 3.0, y - 3.0));
+            }
+            line(out, (x, y0), (x, y1));
+            let (tx, ty) = (x - 6.0, (y0 + y1) / 2.0);
+            let _ = write!(
+                out,
+                r##"<text class="dimension-text" x="{tx:.2}" y="{ty:.2}" font-size="12" text-anchor="middle" fill="#111" transform="rotate(-90 {tx:.2} {ty:.2})">{}</text>"##,
+                escape(&dimension.text)
+            );
+        }
+    }
 }
 
 /// Points at grid north, which is the site's y axis turned back by the
@@ -1122,6 +1295,16 @@ fn format_metres(metres: f64) -> String {
         format!("{metres} m")
     } else {
         format!("{} cm", (metres * 100.0).round())
+    }
+}
+
+/// Millimetres as a detail's scale bar reads: mm below a centimetre, cm
+/// from there.
+fn format_millimetres(mm: f64) -> String {
+    if mm >= 10.0 {
+        format!("{} cm", mm / 10.0)
+    } else {
+        format!("{mm} mm")
     }
 }
 
@@ -1342,7 +1525,8 @@ mod tests {
         for long_side in [400.0, 800.0, 1600.0] {
             let view = View::new(extent, long_side, FOOTER);
             let refs: Vec<&Feature> = features.iter().collect();
-            let placed = place_labels(&refs, &view, 1.0, &font).expect("placed");
+            let arrow = Rect::centred(view.width - MARGIN, ARROW_Y, 2.0 * ARROW_REACH, 2.0 * ARROW_REACH);
+            let placed = place_labels(&refs, &view, 1.0, &font, vec![arrow]).expect("placed");
             assert_eq!(placed.len(), 7);
             // The highlighted lamp goes first, then the rooms by size.
             assert_eq!(placed[0].text, "Reading lamp 4");

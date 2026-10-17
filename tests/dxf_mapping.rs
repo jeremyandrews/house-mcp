@@ -29,6 +29,7 @@ fn options(unit: Option<LengthUnit>, transform: Transform) -> Options {
         unit,
         layers: mapping(),
         transform,
+        frame_unit: LengthUnit::Metres,
     }
 }
 

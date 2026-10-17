@@ -71,6 +71,8 @@ struct UploadQuery {
     floor_id: Option<i64>,
     space_id: Option<i64>,
     object_id: Option<i64>,
+    detail_id: Option<i64>,
+    area_id: Option<i64>,
 }
 
 /// `POST /api/files?name=...`: the body is the file, its Content-Type the
@@ -94,6 +96,8 @@ async fn api_upload(
         floor_id: q.floor_id,
         space_id: q.space_id,
         object_id: q.object_id,
+        detail_id: q.detail_id,
+        area_id: q.area_id,
     };
     let reason = q.reason.unwrap_or_else(|| "uploaded over HTTP".into());
     let file = NewFile {

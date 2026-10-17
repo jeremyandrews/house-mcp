@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 
 use house_mcp::{
     geom::to_wkb,
-    render::{Extent, Feature, Label, LabelSize, Plan, Rendered, Style, Symbol, render},
+    render::{Extent, Feature, Label, LabelSize, Plan, Rendered, Sheet, Style, Symbol, render},
 };
 use resvg::tiny_skia::Pixmap;
 use serde_json::json;
@@ -33,6 +33,7 @@ fn plan(highlight_light: bool) -> Plan {
         title: "Test site, Ground".into(),
         label_size: LabelSize::Normal,
         not_placed: 0,
+        sheet: Sheet::default(),
         rotation: 30.0,
         extent: Extent {
             xmin: 0.0,
@@ -164,6 +165,7 @@ fn room_plan(dx: f64, dy: f64, rotation: f64) -> Plan {
         title: "Shape".into(),
         label_size: LabelSize::Normal,
         not_placed: 0,
+        sheet: Sheet::default(),
         rotation,
         extent: Extent {
             xmin: 0.0,
@@ -331,6 +333,7 @@ fn tall_plan_fits_the_long_side_with_room_for_the_footer() {
         title: "Tall".into(),
         label_size: LabelSize::Normal,
         not_placed: 0,
+        sheet: Sheet::default(),
         rotation: 0.0,
         extent: Extent {
             xmin: 0.0,

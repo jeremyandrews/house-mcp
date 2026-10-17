@@ -1,19 +1,23 @@
 //! The MCP tools.
 //!
 //! Read tools are in `read` and `connections`, write tools in `write`, the
-//! two importers in `import` and the plan renderer in `plan`. A write tool is one in the write
+//! two importers in `import`, the plan renderer in `plan`, and the levels
+//! below an object (details) and above a site (areas) in `levels`. A write tool is one in the write
 //! router; the handler refuses those to a read only caller before they run,
 //! and hides them from that caller's tool list.
 //!
 //! Every read of a floor, space or object goes through the `live_floor`,
 //! `live_space` and `live_object` views, which leave out a row whose site or
-//! floor is deleted as well as one deleted itself. Writes use the tables.
+//! floor is deleted as well as one deleted itself. Details, their parts and
+//! areas are read through `live_detail`, `live_detail_part` and `live_area`,
+//! and no floor or site query reads them. Writes use the tables.
 
 #[macro_use]
 mod sql;
 
 mod connections;
 mod import;
+mod levels;
 mod plan;
 mod read;
 mod write;
@@ -57,8 +61,10 @@ impl House {
         Self {
             db,
             files,
-            read_tools: Arc::new(Self::read_router() + Self::plan_router() + Self::connections_router()),
-            write_tools: Arc::new(Self::write_router() + Self::import_router()),
+            read_tools: Arc::new(
+                Self::read_router() + Self::plan_router() + Self::connections_router() + Self::levels_read_router(),
+            ),
+            write_tools: Arc::new(Self::write_router() + Self::import_router() + Self::levels_write_router()),
         }
     }
 }
@@ -126,7 +132,12 @@ impl ServerHandler for House {
 const INSTRUCTIONS: &str = "A model of a house and its grounds. Each site has its own frame: metres, x east, y north, \
 with an origin chosen when the site was made. Every coordinate a tool takes or returns is in that frame unless a \
 tool says otherwise. Ask spatial questions with what_is_at, in_space, nearest, measure and connections rather than \
-working them out from coordinates. Every write needs a reason, which is kept with the change.";
+working them out from coordinates. The model has levels both ways from site, floor, space and object: \
+below an object, details (drawings of it, such as a table seen from the top, in their own millimetre frame, nested to \
+any depth, with labelled parts, measurements and files); above a site, areas (neighbourhood, town, region, nested to \
+any depth). Every level and measurement is optional and says how precise it is. context walks the levels from any \
+row; get_detail reads a detail; render_plan draws a floor, a site, a detail or an area. find and in_space mark an \
+object that has details or files. Every write needs a reason, which is kept with the change.";
 
 /// The kinds of thing that can be deleted, restored or have a history.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -138,6 +149,9 @@ pub enum Kind {
     Object,
     File,
     Note,
+    Detail,
+    DetailPart,
+    Area,
 }
 
 impl Kind {
@@ -149,6 +163,9 @@ impl Kind {
             Self::Object => "object",
             Self::File => "file",
             Self::Note => "note",
+            Self::Detail => "detail",
+            Self::DetailPart => "detail_part",
+            Self::Area => "area",
         }
     }
 }
@@ -170,6 +187,10 @@ pub struct Links {
     pub floor_id: Option<i64>,
     pub space_id: Option<i64>,
     pub object_id: Option<i64>,
+    /// A detail drawing of an object, from upsert_detail.
+    pub detail_id: Option<i64>,
+    /// An area around sites, such as a town, from upsert_area.
+    pub area_id: Option<i64>,
 }
 
 /// The oldest live record of a file content.

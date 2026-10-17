@@ -406,3 +406,87 @@ async fn the_placement_migration_fills_from_the_position_attribute() {
         .expect_err("refused");
     assert!(refused.to_string().contains("object_placement"), "{refused}");
 }
+
+#[tokio::test]
+async fn an_import_onto_a_detail_has_neither_floor_nor_site() {
+    let db = TestDb::new().await;
+    let pool = db.migrated_pool().await;
+    let (site, object, _) = seed(&pool).await;
+    let floor: i64 = sqlx::query_scalar("SELECT id FROM floor WHERE site_id = $1")
+        .bind(site)
+        .fetch_one(&pool)
+        .await
+        .expect("floor");
+    let detail: i64 = sqlx::query_scalar(
+        "INSERT INTO detail (site_id, object_id, name, view) VALUES ($1, $2, 'top', 'top') RETURNING id",
+    )
+    .bind(site)
+    .bind(object)
+    .fetch_one(&pool)
+    .await
+    .expect("detail");
+    let file: i64 = sqlx::query_scalar(
+        "INSERT INTO file (name, media_type, size, sha256) VALUES ('a.dxf', 'image/vnd.dxf', 1, repeat('0', 64)) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("file");
+    let import = |floor: Option<i64>, site: Option<i64>, detail: Option<i64>| {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO dxf_import (file_id, sha256, floor_id, site_id, detail_id, unit, options, summary)
+             VALUES ($1, repeat('0', 64), $2, $3, $4, 'mm', '{}', '{}') RETURNING id",
+        )
+        .bind(file)
+        .bind(floor)
+        .bind(site)
+        .bind(detail)
+        .fetch_one(&pool)
+    };
+    for (floor, site) in [(Some(floor), None), (None, Some(site)), (Some(floor), Some(site))] {
+        let error = import(floor, site, Some(detail))
+            .await
+            .expect_err("a detail import has no other place");
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some("dxf_import_has_a_place")
+        );
+    }
+    import(None, None, Some(detail)).await.expect("onto the detail");
+    // The same drawing onto the site alongside it is a different place.
+    import(None, Some(site), None).await.expect("onto the site");
+    let twice = import(None, None, Some(detail))
+        .await
+        .expect_err("one live import per detail");
+    assert_eq!(
+        twice.as_database_error().and_then(|e| e.constraint()),
+        Some("dxf_import_detail_live")
+    );
+    // Measurements and placements are checked in the table too.
+    for (column, value) in [
+        ("measurements", r#"{"width": {"value": 0, "source": "measured"}}"#),
+        ("measurements", r#"{"width": {"value": 10, "source": "guessed"}}"#),
+        ("measurements", r#"{"weight": {"value": 10, "source": "measured"}}"#),
+        ("measurements", r#"{"width": "wide"}"#),
+        ("placement", r#"{"x": 1}"#),
+        ("placement", r#"{"x": 1, "y": 2, "scale": 0}"#),
+        ("placement", r#"{"x": 1, "y": 2, "scale": "big"}"#),
+    ] {
+        let sql = format!("UPDATE detail SET {column} = $2::jsonb WHERE id = $1");
+        let error = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(detail)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .expect_err(value);
+        let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+        assert_eq!(code.as_deref(), Some("23514"), "{value}: {error}");
+    }
+    sqlx::query(
+        r#"UPDATE detail SET measurements = '{"width": {"value": 2400, "source": "measured"}, "height": {"value": 720.5, "source": "estimated"}}',
+                             placement = '{"x": 1, "y": -2, "rotation": 90, "scale": 0.5}' WHERE id = $1"#,
+    )
+    .bind(detail)
+    .execute(&pool)
+    .await
+    .expect("valid measurements and placement");
+}

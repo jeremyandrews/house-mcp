@@ -1,4 +1,5 @@
-//! Reads a DXF drawing into site frame geometry.
+//! Reads a DXF drawing into site frame geometry, or into a detail's
+//! millimetre frame.
 //!
 //! This module only reads and transforms coordinates. Which space a text
 //! label falls in, and whether a polygon is valid, are decided by PostGIS when
@@ -36,10 +37,14 @@ pub enum LayerTarget {
     Space(String),
     /// Block insertions on the layer become objects of this kind.
     Object(String),
+    /// On a detail, closed polylines on the layer become labelled parts,
+    /// named by the text inside them, or by this word and a number.
+    Part(String),
 }
 
-/// Applied after the drawing's units are converted to metres: scale, then
-/// rotation about the drawing's origin, then offset.
+/// Applied after the drawing's units are converted to the frame's (metres
+/// on a floor or site, millimetres on a detail): scale, then rotation about
+/// the drawing's origin, then offset in the frame's units.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct Transform {
     #[serde(default)]
@@ -73,6 +78,9 @@ pub struct Options {
     pub unit: Option<LengthUnit>,
     pub layers: HashMap<String, LayerTarget>,
     pub transform: Transform,
+    /// The unit of the frame the drawing goes into: metres for a floor or a
+    /// site, millimetres for a detail.
+    pub frame_unit: LengthUnit,
 }
 
 #[derive(Debug)]
@@ -127,6 +135,12 @@ pub struct LayerCount {
     pub entities: usize,
     pub spaces: usize,
     pub objects: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parts: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,6 +156,8 @@ pub struct Parsed {
     pub linework: Vec<Linework>,
     pub spaces: Vec<SpaceCandidate>,
     pub objects: Vec<ObjectCandidate>,
+    /// Closed outlines on part layers, with the layer's word in `kind`.
+    pub parts: Vec<SpaceCandidate>,
     pub layers: BTreeMap<String, LayerCount>,
     /// Each distinct skip with how many entities it applied to.
     pub skipped: BTreeMap<Skipped, usize>,
@@ -175,11 +191,12 @@ pub fn parse(bytes: &[u8], options: &Options) -> Result<Parsed, ImportError> {
             linework: Vec::new(),
             spaces: Vec::new(),
             objects: Vec::new(),
+            parts: Vec::new(),
             layers: BTreeMap::new(),
             skipped: BTreeMap::new(),
         },
     };
-    let base = Affine::user(unit.metres(), &options.transform);
+    let base = Affine::user(unit.metres() / options.frame_unit.metres(), &options.transform);
     for entity in drawing.entities() {
         if entity.common.is_in_paper_space {
             reader.skip(
@@ -443,17 +460,32 @@ impl<'a> Reader<'a> {
         if !self.push_linework(layer, entity, &Shape::Line(&points), None)? {
             return Ok(());
         }
-        if let Some(LayerTarget::Space(kind)) = self.target(layer) {
-            if closed && points.len() >= 4 {
-                self.out.layers.entry(layer.to_owned()).or_default().spaces += 1;
-                self.out.spaces.push(SpaceCandidate {
-                    layer: layer.to_owned(),
-                    kind: kind.clone(),
-                    polygon: json!({"type": "Polygon", "coordinates": [points_json(&points)]}),
-                });
-            } else {
-                self.skip(layer, entity, "open polyline on a space layer");
+        match self.target(layer) {
+            Some(LayerTarget::Space(kind)) => {
+                if closed && points.len() >= 4 {
+                    self.out.layers.entry(layer.to_owned()).or_default().spaces += 1;
+                    self.out.spaces.push(SpaceCandidate {
+                        layer: layer.to_owned(),
+                        kind: kind.clone(),
+                        polygon: json!({"type": "Polygon", "coordinates": [points_json(&points)]}),
+                    });
+                } else {
+                    self.skip(layer, entity, "open polyline on a space layer");
+                }
             }
+            Some(LayerTarget::Part(word)) => {
+                if closed && points.len() >= 4 {
+                    self.out.layers.entry(layer.to_owned()).or_default().parts += 1;
+                    self.out.parts.push(SpaceCandidate {
+                        layer: layer.to_owned(),
+                        kind: word.clone(),
+                        polygon: json!({"type": "Polygon", "coordinates": [points_json(&points)]}),
+                    });
+                } else {
+                    self.skip(layer, entity, "open polyline on a part layer");
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

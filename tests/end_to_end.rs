@@ -4,110 +4,15 @@
 mod common;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::{TestDb, drawing, on_layer, rectangle, save, two_room_dxf};
-use house_mcp::config::{Config, Token};
-use resvg::tiny_skia::Pixmap;
-use rmcp::{
-    RoleClient, ServiceExt,
-    model::{CallToolRequestParams, CallToolResult},
-    service::RunningService,
-    transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
+use common::{
+    drawing,
+    mcp::{RO, RW, call, client, column, ok, sorted_names, start, svg_of},
+    on_layer, rectangle, save, two_room_dxf,
 };
+use resvg::tiny_skia::Pixmap;
+use rmcp::{RoleClient, model::CallToolResult, service::RunningService};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-
-const RW: &str = "rw-token-for-tests-0123456789abcdef0123456789";
-const RO: &str = "ro-token-for-tests-0123456789abcdef0123456789";
-
-struct Server {
-    base: String,
-    _files: tempfile::TempDir,
-    db: TestDb,
-}
-
-async fn start() -> Server {
-    let db = TestDb::new().await;
-    let files = tempfile::tempdir().expect("tempdir");
-    let config = Config {
-        database_url: db.house_url(),
-        files_dir: files.path().to_owned(),
-        listen: "127.0.0.1:0".parse().expect("address"),
-        allowed_hosts: vec!["127.0.0.1".into()],
-        read_write: Token {
-            name: "jesse".into(),
-            secret: RW.into(),
-        },
-        read_only: Token {
-            name: "readonly".into(),
-            secret: RO.into(),
-        },
-    };
-    let app = house_mcp::app(&config).await.expect("app");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let base = format!("http://{}", listener.local_addr().expect("address"));
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    Server {
-        base,
-        _files: files,
-        db,
-    }
-}
-
-async fn client(server: &Server, token: &str) -> RunningService<RoleClient, ()> {
-    let config = StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", server.base)).auth_header(token);
-    ().serve(StreamableHttpClientTransport::from_config(config))
-        .await
-        .expect("MCP client")
-}
-
-async fn call(
-    client: &RunningService<RoleClient, ()>,
-    tool: &'static str,
-    args: Value,
-) -> Result<CallToolResult, String> {
-    let Value::Object(args) = args else {
-        panic!("arguments are an object")
-    };
-    client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-async fn ok(client: &RunningService<RoleClient, ()>, tool: &'static str, args: Value) -> Value {
-    let result = call(client, tool, args).await.unwrap_or_else(|e| panic!("{tool}: {e}"));
-    let text = result.content.iter().find_map(|c| c.as_text()).expect("text content");
-    serde_json::from_str(&text.text).unwrap_or_else(|_| Value::String(text.text.clone()))
-}
-
-/// The SVG among a plan's text blocks, if it has one.
-fn svg_of(result: &CallToolResult) -> Option<String> {
-    result
-        .content
-        .iter()
-        .filter_map(|c| c.as_text())
-        .find(|t| t.text.starts_with("<svg"))
-        .map(|t| t.text.clone())
-}
-
-/// One field of every item in a list, in order.
-fn column(list: &Value, key: &str) -> Vec<Value> {
-    list.as_array()
-        .expect("a list")
-        .iter()
-        .map(|item| item[key].clone())
-        .collect()
-}
-
-/// The names in `list[key]`, sorted, for lists whose order is not promised.
-fn sorted_names(list: &Value, key: &str) -> Vec<String> {
-    let mut names: Vec<String> = column(&list[key], "name")
-        .iter()
-        .map(|name| name.as_str().expect("name").to_owned())
-        .collect();
-    names.sort();
-    names
-}
 
 #[tokio::test]
 async fn end_to_end() {
@@ -130,12 +35,14 @@ async fn end_to_end() {
         .into_iter()
         .map(|t| t.name.into())
         .collect();
-    assert_eq!(rw_tools.len(), 26, "{rw_tools:?}");
+    assert_eq!(rw_tools.len(), 32, "{rw_tools:?}");
     assert_eq!(
         ro_tools,
         [
             "connections",
+            "context",
             "find",
+            "get_detail",
             "get_file",
             "get_floor",
             "history",

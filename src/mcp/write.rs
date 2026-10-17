@@ -41,6 +41,9 @@ macro_rules! per_table {
             Kind::Object => concat!($a, "object", $b),
             Kind::File => concat!($a, "file", $b),
             Kind::Note => concat!($a, "note", $b),
+            Kind::Detail => concat!($a, "detail", $b),
+            Kind::DetailPart => concat!($a, "detail_part", $b),
+            Kind::Area => concat!($a, "area", $b),
         }
     };
     ($kind:expr, $a:literal, $b:literal, $c:literal) => {
@@ -51,6 +54,9 @@ macro_rules! per_table {
             Kind::Object => concat!($a, "object", $b, "object", $c),
             Kind::File => concat!($a, "file", $b, "file", $c),
             Kind::Note => concat!($a, "note", $b, "note", $c),
+            Kind::Detail => concat!($a, "detail", $b, "detail", $c),
+            Kind::DetailPart => concat!($a, "detail_part", $b, "detail_part", $c),
+            Kind::Area => concat!($a, "area", $b, "area", $c),
         }
     };
 }
@@ -71,6 +77,9 @@ pub struct CreateSiteParams {
     pub origin: Option<Origin>,
     /// Degrees clockwise from grid north to the site's y axis. Default 0.
     pub rotation: Option<f64>,
+    /// The area the site is in, such as its neighbourhood. Omit to let the
+    /// site be in the smallest area whose outline covers its origin.
+    pub area_id: Option<i64>,
     pub reason: String,
 }
 
@@ -88,7 +97,7 @@ pub struct SetSiteOriginParams {
 
 /// A field a caller may leave out, send as null, or send with a value:
 /// `None` when left out, `Some(None)` for null.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(super) fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -259,7 +268,7 @@ pub struct ThingParams {
 #[tool_router(router = write_router, vis = "pub(super)")]
 impl House {
     #[tool(
-        description = "Create a site, optionally with its origin on the earth (any EPSG code) and its rotation from grid north."
+        description = "Create a site, optionally with its origin on the earth (any EPSG code), its rotation from grid north, and `area_id`, the area it is in (a neighbourhood, town or region from upsert_area; set_site_area changes it later). A site with no `area_id` is in the smallest area whose outline covers its origin."
     )]
     async fn create_site(
         &self,
@@ -276,10 +285,13 @@ impl House {
         if let Some(origin) = &p.origin {
             check_epsg(&mut tx, "origin.epsg", origin.epsg).await?;
         }
+        if let Some(area) = p.area_id {
+            check_live_area(&mut tx, "area_id", area).await?;
+        }
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO site (name, origin, rotation)
+            "INSERT INTO site (name, origin, rotation, area_id)
              VALUES ($1, CASE WHEN $2::int IS NULL THEN NULL
-                              ELSE ST_Transform(ST_SetSRID(ST_MakePoint($3, $4), $2), 32632) END, $5)
+                              ELSE ST_Transform(ST_SetSRID(ST_MakePoint($3, $4), $2), 32632) END, $5, $6)
              RETURNING id",
         )
         .bind(p.name.trim())
@@ -287,6 +299,7 @@ impl House {
         .bind(p.origin.as_ref().map(|o| o.x))
         .bind(p.origin.as_ref().map(|o| o.y))
         .bind(rotation)
+        .bind(p.area_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| origin_error(e, p.origin.as_ref()))?;
@@ -564,7 +577,7 @@ impl House {
     }
 
     #[tool(
-        description = "Add a markdown note, with where it came from, optionally linked to a site, floor, space or object."
+        description = "Add a markdown note, with where it came from, optionally linked (in `links`) to a site, floor, space or object, and to a detail (a drawing inside an object, from upsert_detail) or an area around sites (such as a town, from upsert_area). Example: {\"body\": \"Oiled the top\", \"links\": {\"detail_id\": 4}, \"reason\": \"maintenance\"}."
     )]
     async fn add_note(
         &self,
@@ -587,12 +600,13 @@ impl House {
         .fetch_one(&mut *tx)
         .await
         .map_err(error::db)?;
+        insert_level_link(&mut tx, LinkTable::Note, id, &p.links).await?;
         tx.commit().await.map_err(error::db)?;
         json_result(json!({ "id": id }))
     }
 
     #[tool(
-        description = "Store a file (text inline, or binary as base64 up to 25 MiB), optionally linked to a site, floor, space or object. Larger files go through POST /api/files."
+        description = "Store a file (text inline, or binary as base64 up to 25 MiB), optionally linked (in `links`) to a site, floor, space or object, and to a detail (a drawing inside an object, from upsert_detail) or an area around sites (such as a town, from upsert_area). get_file shows a stored PNG, JPEG or WebP as an image and a PDF page by page. Larger files go through POST /api/files. Example: {\"name\": \"quote.pdf\", \"base64\": \"...\", \"links\": {\"detail_id\": 4}, \"reason\": \"maker's quote\"}."
     )]
     async fn upload_file(
         &self,
@@ -647,7 +661,7 @@ impl House {
     }
 
     #[tool(
-        description = "Mark a site, floor, space, object, file or note as deleted. Nothing is removed; restore brings it back. Deleting a site or floor marks only that row, but every read tool then hides what it holds as well: a site's floors, spaces and objects, a floor's spaces and objects. The reply's `hides` counts the floors, spaces and objects that were visible and no longer are, the deleted floor itself included. Restoring the site or floor brings them all back as they were."
+        description = "Mark a site, floor, space, object, file, note, detail, detail_part or area as deleted. Nothing is removed; restore brings it back. Deleting a site or floor marks only that row, but every read tool then hides what it holds as well: a site's floors, spaces and objects, a floor's spaces and objects. The reply's `hides` counts the floors, spaces and objects that were visible and no longer are, the deleted floor itself included. Restoring the site or floor brings them all back as they were. Deleting a detail likewise hides its parts, its linework and the details inside it, and deleting an area hides the areas inside it (its sites stay, in no area by it); restoring brings them back."
     )]
     async fn delete(
         &self,
@@ -681,7 +695,7 @@ impl House {
     }
 
     #[tool(
-        description = "Bring back a deleted site, floor, space, object, file or note, including one removed outright by another client, from its recorded history. Restoring a site or floor brings back the floors, spaces and objects it held as they were, since deleting it marked only that row; one deleted on its own before stays deleted."
+        description = "Bring back a deleted site, floor, space, object, file, note, detail, detail_part or area, including one removed outright by another client, from its recorded history. Restoring a site or floor brings back the floors, spaces and objects it held as they were, since deleting it marked only that row; one deleted on its own before stays deleted."
     )]
     async fn restore(
         &self,
@@ -763,23 +777,100 @@ async fn restore_removed_row(tx: &mut PgConnection, kind: Kind, id: i64) -> Resu
         " OVERRIDING SYSTEM VALUE SELECT * FROM jsonb_populate_record(NULL::",
         ", $2 || $1 || '{\"deleted_at\": null}'::jsonb)"
     ))
-    .bind(before)
-    .bind(added_column_defaults(kind))
+    .bind(&before)
+    .bind(added_column_defaults(kind, &before))
+    .execute(&mut *tx)
+    .await
+    .map_err(error::db)?;
+    if kind == Kind::Note {
+        restore_removed_note_link(tx, id).await?;
+    }
+    Ok(())
+}
+
+/// A note removed outright takes its link to a detail or an area with it,
+/// through the link's ON DELETE CASCADE; this puts the last recorded link
+/// back with the note.
+async fn restore_removed_note_link(tx: &mut PgConnection, note_id: i64) -> Result<(), ErrorData> {
+    sqlx::query(
+        "WITH last AS (
+             SELECT before FROM change
+             WHERE table_name = 'note_link' AND operation = 'DELETE' AND (before ->> 'note_id')::bigint = $1
+             ORDER BY id DESC LIMIT 1
+         )
+         INSERT INTO note_link OVERRIDING SYSTEM VALUE
+         SELECT r.* FROM last CROSS JOIN jsonb_populate_record(NULL::note_link, last.before) AS r
+         WHERE NOT EXISTS (SELECT 1 FROM note_link WHERE note_id = $1)",
+    )
+    .bind(note_id)
     .execute(&mut *tx)
     .await
     .map_err(error::db)?;
     Ok(())
 }
 
-/// The defaults of NOT NULL columns added to a table after rows were first
-/// recorded, which a row recorded before then lacks. jsonb_populate_record
-/// fills a missing key with null rather than the column's default.
-fn added_column_defaults(kind: Kind) -> Value {
+/// The values of NOT NULL columns added to a table after rows were first
+/// recorded, for a row recorded before then, which lacks them.
+/// jsonb_populate_record fills a missing key with null rather than the
+/// column's default; a key the recorded row has wins over these.
+fn added_column_defaults(kind: Kind, before: &Value) -> Value {
     match kind {
         Kind::Site | Kind::Floor => json!({ "attributes": {} }),
-        Kind::Object => json!({ "placement": "exact" }),
-        Kind::Space | Kind::File | Kind::Note => json!({}),
+        Kind::Object => json!({ "placement": placement_from_position(before) }),
+        Kind::Space | Kind::File | Kind::Note | Kind::Detail | Kind::DetailPart | Kind::Area => json!({}),
     }
+}
+
+/// An object's placement as migration 0004 filled it from the `position`
+/// attribute: `unplaced` for `site_unplaced`, `approximate` for any other
+/// value, and `exact` when there is none.
+fn placement_from_position(object: &Value) -> &'static str {
+    match object.get("attributes").and_then(|a| a.get("position")) {
+        None | Some(Value::Null) => "exact",
+        Some(Value::String(position)) if position == "site_unplaced" => "unplaced",
+        Some(_) => "approximate",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LinkTable {
+    File,
+    Note,
+}
+
+/// Links a new file or note to a detail or an area, when its links name one,
+/// refusing one that is not live.
+async fn insert_level_link(tx: &mut PgConnection, table: LinkTable, id: i64, links: &Links) -> Result<(), ErrorData> {
+    if links.detail_id.is_none() && links.area_id.is_none() {
+        return Ok(());
+    }
+    let (detail, area): (bool, bool) = sqlx::query_as(
+        "SELECT $1::bigint IS NULL OR EXISTS (SELECT 1 FROM live_detail WHERE id = $1),
+                $2::bigint IS NULL OR EXISTS (SELECT 1 FROM live_area WHERE id = $2)",
+    )
+    .bind(links.detail_id)
+    .bind(links.area_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(error::db)?;
+    if !detail {
+        return Err(error::invalid("links.detail_id", "no live detail with this id"));
+    }
+    if !area {
+        return Err(error::invalid("links.area_id", "no live area with this id"));
+    }
+    let sql = match table {
+        LinkTable::File => "INSERT INTO file_link (file_id, detail_id, area_id) VALUES ($1, $2, $3)",
+        LinkTable::Note => "INSERT INTO note_link (note_id, detail_id, area_id) VALUES ($1, $2, $3)",
+    };
+    sqlx::query(sql)
+        .bind(id)
+        .bind(links.detail_id)
+        .bind(links.area_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(error::db)?;
+    Ok(())
 }
 
 pub struct NewFile<'a> {
@@ -830,6 +921,7 @@ pub async fn store_file(
     .fetch_one(&mut *tx)
     .await
     .map_err(error::db)?;
+    insert_level_link(&mut tx, LinkTable::File, id, file.links).await?;
     tx.commit().await.map_err(error::db)?;
     Ok(json!({ "id": id, "name": name, "media_type": media_type, "size": file.bytes.len(), "sha256": sha.as_str() }))
 }
@@ -858,6 +950,7 @@ fn guess_media_type(name: &str) -> &'static str {
         Some("pdf") => "application/pdf",
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
         Some("heic") => "image/heic",
         Some("svg") => "image/svg+xml",
         Some("txt") => "text/plain",
@@ -869,7 +962,7 @@ fn guess_media_type(name: &str) -> &'static str {
 
 /// Refuses a create that leaves out a field only an update may leave out,
 /// naming the first one missing.
-fn required_on_create<const N: usize>(what: &str, fields: [(&str, bool); N]) -> Result<(), ErrorData> {
+pub(super) fn required_on_create<const N: usize>(what: &str, fields: [(&str, bool); N]) -> Result<(), ErrorData> {
     match fields.into_iter().find(|(_, given)| !given) {
         Some((field, _)) => Err(error::invalid(
             field,
@@ -946,6 +1039,20 @@ pub(super) async fn check_epsg(tx: &mut PgConnection, field: &str, epsg: i32) ->
     }
 }
 
+/// Refuses an area id that names no live area.
+pub(super) async fn check_live_area(tx: &mut PgConnection, field: &str, id: i64) -> Result<(), ErrorData> {
+    let live: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM live_area WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(error::db)?;
+    if live {
+        Ok(())
+    } else {
+        Err(error::invalid(field, "no live area with this id"))
+    }
+}
+
 /// Asks PostGIS whether a caller's geometry is of an allowed type, within the
 /// vertex limit and valid.
 pub(super) async fn check_geometry(
@@ -1008,6 +1115,22 @@ mod tests {
         assert_eq!(object_kind("kind", "cable-run").ok().as_deref(), Some("cable_run"));
         assert!(object_kind("kind", "9lives").is_err());
         assert!(object_kind("kind", "light; drop table").is_err());
+    }
+
+    #[test]
+    fn placement_comes_from_the_position_attribute_when_history_lacks_it() {
+        let position = |p: Value| json!({"attributes": {"position": p}});
+        assert_eq!(placement_from_position(&position(json!("site_unplaced"))), "unplaced");
+        assert_eq!(placement_from_position(&position(json!("room_centre"))), "approximate");
+        assert_eq!(placement_from_position(&position(json!(3))), "approximate");
+        assert_eq!(placement_from_position(&position(Value::Null)), "exact");
+        assert_eq!(placement_from_position(&json!({"attributes": {}})), "exact");
+        // A recorded placement wins, since it is merged over these.
+        let recorded = json!({"placement": "approximate", "attributes": {}});
+        assert_eq!(
+            added_column_defaults(Kind::Object, &recorded),
+            json!({"placement": "exact"})
+        );
     }
 
     #[test]

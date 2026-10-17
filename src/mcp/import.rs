@@ -13,8 +13,10 @@ use serde_json::{Value, json};
 use sqlx::{PgConnection, Row};
 
 use super::{
-    House, json_result, reason, wkb,
-    write::{OBJECT_GEOMETRY_TYPES, check_epsg, check_geometry, check_space_kind, object_kind},
+    House, json_result,
+    levels::check_live_detail,
+    reason, wkb,
+    write::{OBJECT_GEOMETRY_TYPES, check_epsg, check_geometry, check_live_area, check_space_kind, object_kind},
     writer,
 };
 use crate::{
@@ -31,20 +33,25 @@ const MAX_FEATURES: usize = 10_000;
 pub enum FeatureTarget {
     Space,
     Object,
+    /// An area around sites, such as a town from a geoportal; needs no site.
+    Area,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ImportGeoJsonParams {
-    pub site_id: i64,
+    /// The site to import spaces or objects onto. Not used for areas.
+    pub site_id: Option<i64>,
     /// Put everything on this floor; omit for outdoor spaces and objects.
     pub floor_id: Option<i64>,
+    /// For areas: the area every imported area is inside.
+    pub parent_area_id: Option<i64>,
     /// A stored GeoJSON file. Give this or `geojson`.
     pub file_sha256: Option<String>,
     /// An inline FeatureCollection or Feature.
     pub geojson: Option<Value>,
     /// EPSG code of the coordinates. Default 4326, longitude and latitude.
     pub epsg: Option<i32>,
-    /// Whether each feature becomes a space or an object.
+    /// Whether each feature becomes a space, an object or an area.
     #[serde(rename = "as")]
     pub target: FeatureTarget,
     /// The kind for every feature, unless `kind_property` names a property
@@ -64,11 +71,16 @@ pub struct ImportDxfParams {
     /// The floor to import onto. Omit, and give `site_id`, to import a
     /// drawing of the grounds onto the site itself.
     pub floor_id: Option<i64>,
+    /// A detail to import onto instead (a drawing of an object, from
+    /// upsert_detail), given alone. The drawing is converted to the detail's
+    /// millimetres, and layers mapped to `part` become its parts.
+    pub detail_id: Option<i64>,
     /// Needed without `floor_id`. With it, it may be left out, and if given
     /// must be the floor's site.
     pub site_id: Option<i64>,
     /// DXF layer name (any case) to what its entities become beyond linework,
-    /// such as `{"ROOMS": {"space": "room"}, "LIGHTS": {"object": "light"}}`.
+    /// such as `{"ROOMS": {"space": "room"}, "LIGHTS": {"object": "light"}}`
+    /// on a floor or site, or `{"PARTS": {"part": "part"}}` on a detail.
     #[serde(default)]
     pub layers: HashMap<String, LayerTarget>,
     /// The drawing's unit, needed when its $INSUNITS header names none, and
@@ -82,7 +94,7 @@ pub struct ImportDxfParams {
 #[tool_router(router = import_router, vis = "pub(super)")]
 impl House {
     #[tool(
-        description = "Import GeoJSON features in any EPSG coordinate system as spaces or objects, converted into the site frame. This is how a land registry parcel or a geoportal layer arrives. The site must be georeferenced."
+        description = "Import GeoJSON features in any EPSG coordinate system as spaces or objects, converted into the site frame, or as areas around sites (`as: area`), stored in WGS 84. This is how a land registry parcel, a geoportal layer or a town's boundary arrives. Spaces and objects need `site_id`, and the site must be georeferenced. Areas need no site: each feature becomes one area, of `kind` (such as `town`) or the kind in `kind_property`, inside `parent_area_id` when given, and its geometry must be a Polygon or MultiPolygon. Example: {\"as\": \"area\", \"kind\": \"municipality\", \"name_property\": \"NAME\", \"file_sha256\": \"...\", \"reason\": \"boundary from the geoportal\"}."
     )]
     async fn import_geojson(
         &self,
@@ -97,6 +109,21 @@ impl House {
             _ => return Err(error::invalid("geojson", "give exactly one of file_sha256 and geojson")),
         };
         let features = features(&document)?;
+        match p.target {
+            FeatureTarget::Area if p.site_id.is_some() || p.floor_id.is_some() => {
+                return Err(error::invalid(
+                    "site_id",
+                    "an area is not on a site; leave out site_id and floor_id",
+                ));
+            }
+            FeatureTarget::Space | FeatureTarget::Object if p.site_id.is_none() => {
+                return Err(error::invalid("site_id", "is required to import spaces or objects"));
+            }
+            FeatureTarget::Space | FeatureTarget::Object if p.parent_area_id.is_some() => {
+                return Err(error::invalid("parent_area_id", "is only for `as: area`"));
+            }
+            _ => {}
+        }
         let mut rows = Vec::with_capacity(features.len());
         for (i, feature) in features.iter().enumerate() {
             rows.push(feature_row(&p, i, feature)?);
@@ -104,6 +131,9 @@ impl House {
         let epsg = p.epsg.unwrap_or(4326);
         let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
         check_epsg(&mut tx, "epsg", epsg).await?;
+        if let Some(parent) = p.parent_area_id {
+            check_live_area(&mut tx, "parent_area_id", parent).await?;
+        }
         let mut created = Vec::with_capacity(rows.len());
         for row in &rows {
             let made = insert_feature(&mut tx, &p, epsg, row).await?;
@@ -117,7 +147,7 @@ impl House {
     }
 
     #[tool(
-        description = "Import a stored DXF drawing onto a floor, or with `site_id` and no `floor_id` onto the site itself, as for a drawing of the grounds. Every entity is kept as linework, which render_plan draws on that floor, or on the site's outdoor plan (no `floor_id`) for a site import. Closed polylines on a layer mapped to a space kind become spaces named by the text inside them, and block insertions on a layer mapped to an object kind become objects; a site import makes them outdoor ones. A second import of the same file onto the same floor, or onto the same site with no floor, replaces the first. DWG is not read."
+        description = "Import a stored DXF drawing onto a floor, or with `site_id` and no `floor_id` onto the site itself, as for a drawing of the grounds, or with `detail_id` alone onto a detail, as for a maker's drawing of a piece of furniture. Every entity is kept as linework, which render_plan draws on that floor, on the site's outdoor plan (no `floor_id`) for a site import, or on the detail (render_plan {\"detail_id\": ..}) for a detail import, never on a floor or site plan. On a floor or site, closed polylines on a layer mapped to a space kind become spaces named by the text inside them, and block insertions on a layer mapped to an object kind become objects; a site import makes them outdoor ones. On a detail the drawing is converted to the detail's frame, millimetres, from its unit (metres, inches or any other), and closed polylines on a layer mapped to `part` become the detail's labelled parts, named by the text inside them or by the mapped word and a number: {\"detail_id\": 4, \"layers\": {\"PARTS\": {\"part\": \"panel\"}}}. A second import of the same file onto the same floor, the same site with no floor, or the same detail replaces the first. DWG is not read."
     )]
     async fn import_dxf(
         &self,
@@ -126,6 +156,9 @@ impl House {
     ) -> Result<CallToolResult, ErrorData> {
         let author = &writer(&parts)?.name;
         let reason = reason(&p.reason)?;
+        if let Some(detail) = p.detail_id {
+            return self.import_dxf_onto_detail(author, reason, detail, &p).await;
+        }
         let mut layers = HashMap::with_capacity(p.layers.len());
         for (layer, target) in &p.layers {
             let field = format!("layers.{layer}");
@@ -135,6 +168,9 @@ impl House {
                     LayerTarget::Space(kind.clone())
                 }
                 LayerTarget::Object(kind) => LayerTarget::Object(object_kind(&field, kind)?),
+                LayerTarget::Part(_) => {
+                    return Err(error::invalid(&field, "part layers are for a detail; give detail_id"));
+                }
             };
             layers.insert(layer.clone(), target);
         }
@@ -152,6 +188,7 @@ impl House {
             unit: p.unit,
             layers: layers.clone(),
             transform: p.transform.clone(),
+            frame_unit: LengthUnit::Metres,
         };
         let parsed = tokio::task::spawn_blocking(move || dxf_import::parse(&bytes, &options))
             .await
@@ -198,6 +235,97 @@ impl House {
 }
 
 impl House {
+    /// import_dxf onto a detail: linework into detail_linework, outlines on
+    /// part layers into parts, all in the detail's millimetres.
+    async fn import_dxf_onto_detail(
+        &self,
+        author: &str,
+        reason: &str,
+        detail_id: i64,
+        p: &ImportDxfParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        if p.floor_id.is_some() || p.site_id.is_some() {
+            return Err(error::invalid(
+                "detail_id",
+                "give detail_id alone; a detail is not on a floor, and its site is its object's",
+            ));
+        }
+        let mut layers = HashMap::with_capacity(p.layers.len());
+        for (layer, target) in &p.layers {
+            let field = format!("layers.{layer}");
+            match target {
+                LayerTarget::Part(word) => {
+                    let word = word.trim();
+                    if word.is_empty() || word.chars().count() > 100 {
+                        return Err(error::invalid(&field, "the part word must be 1 to 100 characters"));
+                    }
+                    layers.insert(layer.clone(), LayerTarget::Part(word.to_owned()));
+                }
+                _ => {
+                    return Err(error::invalid(
+                        &field,
+                        "a detail takes only part layers, such as {\"part\": \"panel\"}",
+                    ));
+                }
+            }
+        }
+        if !(p.transform.scale.is_finite() && p.transform.scale > 0.0) {
+            return Err(error::invalid("transform.scale", "must be positive"));
+        }
+        let (file, bytes) = self.import_bytes("file_sha256", &p.file_sha256).await?;
+        if is_dwg(&file.name, &bytes) {
+            return Err(error::invalid(
+                "file_sha256",
+                "is a DWG drawing, which this server does not read; convert it to DXF with the free ODA File Converter, upload the DXF and import that",
+            ));
+        }
+        let options = dxf_import::Options {
+            unit: p.unit,
+            layers: layers.clone(),
+            transform: p.transform.clone(),
+            frame_unit: LengthUnit::Millimetres,
+        };
+        let parsed = tokio::task::spawn_blocking(move || dxf_import::parse(&bytes, &options))
+            .await
+            .map_err(|e| error::internal("reading a DXF file", e))?
+            .map_err(|e| error::invalid("file_sha256", e))?;
+
+        let mut tx = db::begin_write(&self.db, author, reason).await.map_err(error::db)?;
+        let site_id = check_live_detail(&mut tx, "detail_id", detail_id).await?;
+        let replaced = retire_previous_detail_import(&mut tx, file.sha.as_str(), detail_id).await?;
+        let summary = json!({
+            "unit": parsed.unit,
+            "unit_from": if parsed.unit_from_call { "call" } else { "$INSUNITS" },
+            "frame": "millimetres",
+            "layers": parsed.layers,
+            "skipped": skipped_json(&parsed),
+        });
+        let options = json!({ "layers": layers, "unit": p.unit, "transform": p.transform });
+        let import_id: i64 = sqlx::query_scalar(
+            "INSERT INTO dxf_import (file_id, sha256, detail_id, unit, options, summary)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(file.id)
+        .bind(file.sha.as_str())
+        .bind(detail_id)
+        .bind(parsed.unit.name())
+        .bind(&options)
+        .bind(&summary)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(error::db)?;
+        insert_detail_linework(&mut tx, import_id, detail_id, site_id, &parsed).await?;
+        let (parts, invalid) = insert_parts(&mut tx, import_id, detail_id, &parsed).await?;
+        tx.commit().await.map_err(error::db)?;
+        let mut result = summary;
+        result["import_id"] = json!(import_id);
+        result["replaced_import_id"] = json!(replaced);
+        result["linework"] = json!(parsed.linework.len());
+        result["parts"] = json!(parts);
+        result["invalid_outlines"] = json!(invalid);
+        json_result(result)
+    }
+
     async fn stored_json(&self, sha: &str) -> Result<Value, ErrorData> {
         let (_, bytes) = self.import_bytes("file_sha256", sha).await?;
         serde_json::from_slice(&bytes).map_err(|e| error::invalid("file_sha256", format!("not JSON: {e}")))
@@ -252,7 +380,7 @@ fn feature_row(p: &ImportGeoJsonParams, i: usize, feature: &Value) -> Result<Fea
             check_space_kind(&field, &kind)?;
             kind
         }
-        FeatureTarget::Object => object_kind(&field, &kind)?,
+        FeatureTarget::Object | FeatureTarget::Area => object_kind(&field, &kind)?,
     };
     let name = match property(&p.name_property) {
         Some(name) => feature_name(&field, &name)?,
@@ -274,6 +402,9 @@ async fn insert_feature(
     epsg: i32,
     row: &FeatureRow,
 ) -> Result<Vec<(i64, String)>, ErrorData> {
+    if let FeatureTarget::Area = p.target {
+        return insert_area(tx, p, epsg, row).await;
+    }
     let local: Vec<u8> =
         sqlx::query_scalar("SELECT ST_AsBinary(house_to_local(ST_SetSRID(ST_GeomFromWKB($1), $2), $3))")
             .bind(&row.wkb)
@@ -283,7 +414,7 @@ async fn insert_feature(
             .await
             .map_err(|e| conversion_error(e, &row.field, epsg))?;
     let allowed = match p.target {
-        FeatureTarget::Space => &["POLYGON", "MULTIPOLYGON"][..],
+        FeatureTarget::Space | FeatureTarget::Area => &["POLYGON", "MULTIPOLYGON"][..],
         FeatureTarget::Object => OBJECT_GEOMETRY_TYPES,
     };
     check_geometry(tx, &row.field, &local, allowed).await?;
@@ -294,7 +425,7 @@ async fn insert_feature(
              FROM ST_Dump(ST_GeomFromWKB($1, 0)) AS d
              RETURNING id, name"
         }
-        FeatureTarget::Object => {
+        FeatureTarget::Object | FeatureTarget::Area => {
             "INSERT INTO object (site_id, floor_id, name, kind, geom)
              VALUES ($2, $3, $4, $5, ST_GeomFromWKB($1, 0))
              RETURNING id, name"
@@ -309,6 +440,30 @@ async fn insert_feature(
         .fetch_all(&mut *tx)
         .await
         .map_err(error::db)
+}
+
+/// One feature as an area: its outline in WGS 84, whole, inside the import's
+/// `parent_area_id` when it has one.
+async fn insert_area(
+    tx: &mut PgConnection,
+    p: &ImportGeoJsonParams,
+    epsg: i32,
+    row: &FeatureRow,
+) -> Result<Vec<(i64, String)>, ErrorData> {
+    check_geometry(tx, &row.field, &row.wkb, &["POLYGON", "MULTIPOLYGON"]).await?;
+    sqlx::query_as(
+        "INSERT INTO area (name, kind, parent_area_id, geom)
+         VALUES ($3, $4, $5, ST_Transform(ST_SetSRID(ST_GeomFromWKB($1), $2), 4326))
+         RETURNING id, name",
+    )
+    .bind(&row.wkb)
+    .bind(epsg)
+    .bind(&row.name)
+    .bind(&row.kind)
+    .bind(p.parent_area_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| conversion_error(e, &row.field, epsg))
 }
 
 /// The site an import goes onto: the floor's when there is a floor, which
@@ -375,6 +530,152 @@ async fn retire_previous_import(
     Ok(previous)
 }
 
+/// Marks an earlier import of the same content onto the same detail as
+/// deleted, with its linework and parts, and returns its id.
+async fn retire_previous_detail_import(
+    tx: &mut PgConnection,
+    sha256: &str,
+    detail_id: i64,
+) -> Result<Option<i64>, ErrorData> {
+    let previous: Option<i64> = sqlx::query_scalar(
+        "UPDATE dxf_import SET deleted_at = now()
+         WHERE sha256 = $1 AND deleted_at IS NULL AND detail_id = $2
+         RETURNING id",
+    )
+    .bind(sha256)
+    .bind(detail_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(error::db)?;
+    if let Some(id) = previous {
+        for sql in [
+            "UPDATE detail_linework SET deleted_at = now() WHERE dxf_import_id = $1 AND deleted_at IS NULL",
+            "UPDATE detail_part SET deleted_at = now() WHERE dxf_import_id = $1 AND deleted_at IS NULL",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *tx).await.map_err(error::db)?;
+        }
+    }
+    Ok(previous)
+}
+
+/// A drawing's linework as the arrays the insert statements unnest.
+type LineworkArrays<'p> = (
+    Vec<&'p str>,
+    Vec<&'static str>,
+    Vec<Vec<u8>>,
+    Vec<Option<&'p str>>,
+    Vec<Option<f64>>,
+);
+
+fn linework_arrays(parsed: &Parsed) -> Result<LineworkArrays<'_>, ErrorData> {
+    let mut arrays: LineworkArrays<'_> = Default::default();
+    for item in &parsed.linework {
+        arrays.0.push(item.layer.as_str());
+        arrays.1.push(item.entity);
+        arrays
+            .2
+            .push(crate::geom::to_wkb(&item.geometry).map_err(|e| error::internal("encoding linework", e))?);
+        arrays.3.push(item.text.as_deref());
+        arrays.4.push(item.text_height);
+    }
+    Ok(arrays)
+}
+
+async fn insert_detail_linework(
+    tx: &mut PgConnection,
+    import_id: i64,
+    detail_id: i64,
+    site_id: i64,
+    parsed: &Parsed,
+) -> Result<(), ErrorData> {
+    let (layers, entities, geometries, texts, heights) = linework_arrays(parsed)?;
+    sqlx::query(
+        "INSERT INTO detail_linework (dxf_import_id, detail_id, site_id, layer, entity, geom, text, text_height)
+         SELECT $1, $2, $8, u.layer, u.entity, ST_GeomFromWKB(u.wkb, 0), u.text, u.height
+         FROM unnest($3::text[], $4::text[], $5::bytea[], $6::text[], $7::float8[]) AS u(layer, entity, wkb, text, height)",
+    )
+    .bind(import_id)
+    .bind(detail_id)
+    .bind(&layers)
+    .bind(&entities)
+    .bind(&geometries)
+    .bind(&texts)
+    .bind(&heights)
+    .bind(site_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(error::db)?;
+    Ok(())
+}
+
+/// Closed outlines on part layers into the detail's parts, each named by the
+/// tallest text of this import inside it, or by its layer's word and a
+/// number. Outlines PostGIS finds invalid are reported, not stored.
+async fn insert_parts(
+    tx: &mut PgConnection,
+    import_id: i64,
+    detail_id: i64,
+    parsed: &Parsed,
+) -> Result<(Vec<Value>, Vec<Value>), ErrorData> {
+    let mut geometries = Vec::new();
+    let mut words = Vec::new();
+    let mut layers = Vec::new();
+    for candidate in &parsed.parts {
+        geometries
+            .push(crate::geom::to_wkb(&candidate.polygon).map_err(|e| error::internal("encoding an outline", e))?);
+        words.push(candidate.kind.as_str());
+        layers.push(candidate.layer.as_str());
+    }
+    let rows = sqlx::query(
+        "WITH candidate AS (
+             SELECT ST_GeomFromWKB(u.wkb, 0) AS geom, u.word, u.layer, u.n
+             FROM unnest($3::bytea[], $4::text[], $5::text[]) WITH ORDINALITY AS u(wkb, word, layer, n)
+         ), labelled AS (
+             SELECT c.*, btrim(label.text) AS text
+             FROM candidate c
+             LEFT JOIN LATERAL (
+                 SELECT l.text FROM detail_linework l
+                 WHERE l.dxf_import_id = $1 AND l.deleted_at IS NULL AND btrim(l.text) <> '' AND ST_Contains(c.geom, l.geom)
+                 ORDER BY l.text_height DESC NULLS LAST, l.id LIMIT 1
+             ) AS label ON true
+             WHERE ST_IsValid(c.geom)
+         ), inserted AS (
+             -- The outlines with no text are numbered among themselves.
+             INSERT INTO detail_part (detail_id, name, geom, attributes, dxf_import_id)
+             SELECT $2,
+                    coalesce(left(l.text, 200),
+                             left(l.word || ' ' || row_number() OVER (PARTITION BY l.word, l.text IS NULL ORDER BY l.n), 200)),
+                    l.geom, jsonb_build_object('dxf_layer', l.layer), $1
+             FROM labelled l
+             ORDER BY l.n
+             RETURNING id, name
+         )
+         SELECT id, name, NULL AS layer, NULL AS problem FROM inserted
+         UNION ALL
+         SELECT NULL, NULL, layer, ST_IsValidReason(geom) FROM candidate WHERE NOT ST_IsValid(geom)",
+    )
+    .bind(import_id)
+    .bind(detail_id)
+    .bind(&geometries)
+    .bind(&words)
+    .bind(&layers)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(error::db)?;
+    let mut parts = Vec::new();
+    let mut invalid = Vec::new();
+    for row in rows {
+        match row.get::<Option<i64>, _>("id") {
+            Some(id) => parts.push(json!({ "id": id, "name": row.get::<String, _>("name") })),
+            None => invalid.push(json!({
+                "layer": row.get::<Option<String>, _>("layer"),
+                "problem": row.get::<Option<String>, _>("problem"),
+            })),
+        }
+    }
+    Ok((parts, invalid))
+}
+
 async fn insert_linework(
     tx: &mut PgConnection,
     import_id: i64,
@@ -382,18 +683,7 @@ async fn insert_linework(
     floor_id: Option<i64>,
     parsed: &Parsed,
 ) -> Result<(), ErrorData> {
-    let mut layers = Vec::new();
-    let mut entities = Vec::new();
-    let mut geometries = Vec::new();
-    let mut texts = Vec::new();
-    let mut heights = Vec::new();
-    for item in &parsed.linework {
-        layers.push(item.layer.as_str());
-        entities.push(item.entity);
-        geometries.push(crate::geom::to_wkb(&item.geometry).map_err(|e| error::internal("encoding linework", e))?);
-        texts.push(item.text.as_deref());
-        heights.push(item.text_height);
-    }
+    let (layers, entities, geometries, texts, heights) = linework_arrays(parsed)?;
     sqlx::query(
         "INSERT INTO linework (dxf_import_id, floor_id, site_id, layer, entity, geom, text, text_height)
          SELECT $1, $2, $8, u.layer, u.entity, ST_GeomFromWKB(u.wkb, 0), u.text, u.height

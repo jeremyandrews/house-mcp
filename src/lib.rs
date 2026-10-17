@@ -12,6 +12,7 @@ mod markup;
 mod mcp;
 pub mod render;
 pub mod units;
+mod view;
 mod web;
 
 use std::sync::{Arc, OnceLock};
